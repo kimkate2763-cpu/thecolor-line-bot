@@ -4,6 +4,7 @@ import re
 import hmac
 import hashlib
 import logging
+import base64
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -35,17 +36,26 @@ SYSTEM_PROMPT = """
 답변은 보통 1~4문장으로 간결하게 작성해.
 사용자의 감정을 먼저 이해하고, 필요할 때 실질적인 도움을 줘.
 확인하지 못한 방 규칙이나 사실을 지어내지 마.
+날씨, 최신 소식, 유행, 현재 정보처럼 최신성이 필요한 질문은
+Google 검색 결과를 바탕으로 답변해.
+검색으로 확인되지 않은 정보는 사실처럼 단정하지 마.
 """
 
 
 def get_db():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL 환경 변수가 설정되지 않았습니다.")
+        raise RuntimeError(
+            "DATABASE_URL 환경 변수가 설정되지 않았습니다."
+        )
+
     return psycopg.connect(
         DATABASE_URL,
         row_factory=dict_row,
         connect_timeout=10,
     )
+
+
+_db_initialized = False
 
 
 def init_database():
@@ -57,36 +67,50 @@ def init_database():
                 user_id TEXT NOT NULL,
                 display_name TEXT NOT NULL,
                 message_type TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL
-                    DEFAULT NOW()
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_message_events_group_date
             ON message_events (group_id, created_at)
         """)
+
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_message_events_user_date
             ON message_events (group_id, user_id, created_at)
         """)
 
 
+def ensure_database():
+    global _db_initialized
+
+    if _db_initialized:
+        return
+
+    init_database()
+    _db_initialized = True
+
+
 def verify_signature(body, signature):
     if not LINE_CHANNEL_SECRET or not signature:
         return False
+
     digest = hmac.new(
         LINE_CHANNEL_SECRET.encode("utf-8"),
         body,
         hashlib.sha256,
     ).digest()
-    import base64
+
     expected = base64.b64encode(digest).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
 
 def line_api(method, endpoint, payload=None):
     if not LINE_CHANNEL_ACCESS_TOKEN:
-        raise RuntimeError("LINE access token이 설정되지 않았습니다.")
+        raise RuntimeError(
+            "LINE access token이 설정되지 않았습니다."
+        )
 
     response = requests.request(
         method,
@@ -98,9 +122,12 @@ def line_api(method, endpoint, payload=None):
         json=payload,
         timeout=15,
     )
+
     response.raise_for_status()
+
     if response.content:
         return response.json()
+
     return {}
 
 
@@ -108,7 +135,6 @@ def reply_text(reply_token, text):
     if not reply_token:
         return
 
-    # LINE 메시지 한 건의 텍스트 길이를 안전하게 제한합니다.
     text = str(text)[:4500]
 
     line_api(
@@ -152,33 +178,38 @@ def record_message(event, source, message):
     if not group_id or not user_id:
         return
 
+    # 메시지 기록 전에 테이블이 준비되어 있는지 확인합니다.
+    ensure_database()
+
     source_type = source.get("type", "")
-    profile = get_member_profile(group_id, user_id, source_type)
+    profile = get_member_profile(
+        group_id,
+        user_id,
+        source_type,
+    )
+
     display_name = (
         (profile or {}).get("displayName")
         or "이름 확인 불가"
     )
 
-    event_id = (
-        event.get("webhookEventId")
-        or event.get("deliveryContext", {}).get("isRedelivery", False)
-        and None
-    )
+    event_id = event.get("webhookEventId")
 
     if not event_id:
-        # webhookEventId가 없으면 메시지 ID를 사용합니다.
         event_id = message.get("id")
+
     if not event_id:
-        # 최후의 대체값: 중복 방지가 보장되지 않을 수 있습니다.
         event_id = hashlib.sha256(
             (
                 str(event.get("timestamp", ""))
-                + group_id + user_id
+                + group_id
+                + user_id
                 + str(message.get("id", ""))
             ).encode("utf-8")
         ).hexdigest()
 
     timestamp = event.get("timestamp")
+
     created_at = (
         datetime.fromtimestamp(timestamp / 1000, tz=KST)
         if timestamp
@@ -211,8 +242,10 @@ def parse_date_range(text):
         r"(\d{4}-\d{2}-\d{2})\s*마딧수",
         text.strip(),
     )
+
     if not match:
         return None
+
     try:
         start = date.fromisoformat(match.group(1))
         end = date.fromisoformat(match.group(2))
@@ -221,13 +254,22 @@ def parse_date_range(text):
 
     if end < start:
         return None
+
     if (end - start).days > 366:
         return None
+
     return start, end
 
 
 def get_ranking(group_id, start, end):
-    start_dt = datetime.combine(start, datetime.min.time(), tzinfo=KST)
+    ensure_database()
+
+    start_dt = datetime.combine(
+        start,
+        datetime.min.time(),
+        tzinfo=KST,
+    )
+
     end_dt = datetime.combine(
         end + timedelta(days=1),
         datetime.min.time(),
@@ -254,14 +296,18 @@ def get_ranking(group_id, start, end):
 
 def format_ranking(rows, start, end):
     if not rows:
-        return f"{start}~{end} 기간에는 기록된 마딧수가 없어요."
+        return (
+            f"{start}~{end} 기간에는 기록된 마딧수가 없어요."
+        )
 
     lines = [f"📊 마딧수 순위 ({start} ~ {end})"]
+
     for index, row in enumerate(rows, start=1):
         lines.append(
             f"{index}위. {row['display_name']} — "
             f"{row['message_count']}마디"
         )
+
     return "\n".join(lines)
 
 
@@ -274,7 +320,8 @@ def gemini_answer(user_text):
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        + GEMINI_MODEL + ":generateContent"
+        + GEMINI_MODEL
+        + ":generateContent"
     )
 
     try:
@@ -288,7 +335,16 @@ def gemini_answer(user_text):
                 "contents": [
                     {
                         "role": "user",
-                        "parts": [{"text": user_text[:4000]}],
+                        "parts": [
+                            {"text": user_text[:4000]}
+                        ],
+                    }
+                ],
+                # Gemini가 질문에 필요한 경우 Google 검색을
+                # 직접 수행하도록 설정합니다.
+                "tools": [
+                    {
+                        "google_search": {}
                     }
                 ],
                 "generationConfig": {
@@ -296,11 +352,67 @@ def gemini_answer(user_text):
                     "maxOutputTokens": 600,
                 },
             },
-            timeout=25,
+            timeout=40,
         )
+
         response.raise_for_status()
         data = response.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+
+        candidates = data.get("candidates", [])
+
+        if not candidates:
+            logger.error("Gemini 응답에 candidates가 없습니다.")
+            return (
+                "앗, 집사 답변을 가져오지 못했어요. "
+                "잠시 후 다시 말씀해 주세요."
+            )
+
+        candidate = candidates[0]
+        parts = candidate.get("content", {}).get("parts", [])
+
+        answer = "\n".join(
+            part.get("text", "")
+            for part in parts
+            if part.get("text")
+        ).strip()
+
+        if not answer:
+            return (
+                "앗, 집사 답변을 가져오지 못했어요. "
+                "질문을 조금 바꿔 다시 말씀해 주세요."
+            )
+
+        # 검색 출처가 반환되면 답변 끝에 함께 표시합니다.
+        metadata = candidate.get("groundingMetadata", {})
+        chunks = metadata.get("groundingChunks", [])
+
+        source_lines = []
+        seen_urls = set()
+
+        for chunk in chunks:
+            web_source = chunk.get("web", {})
+            uri = web_source.get("uri", "")
+            title = web_source.get("title", "")
+
+            if (
+                uri
+                and uri.startswith("https://")
+                and uri not in seen_urls
+            ):
+                seen_urls.add(uri)
+                source_lines.append(
+                    f"• {title or '참고 자료'}\n{uri}"
+                )
+
+            if len(source_lines) >= 3:
+                break
+
+        if source_lines:
+            answer += "\n\n🔎 참고 출처\n"
+            answer += "\n".join(source_lines)
+
+        return answer
+
     except Exception:
         logger.exception("Gemini API 요청 실패")
         return (
@@ -317,37 +429,50 @@ def handle_text(text, event, source):
     if not group_id:
         return
 
+    # 기존 마딧수 명령어 유지
     if stripped == "*마딧수":
         today = datetime.now(KST).date()
-        rows = get_ranking(group_id, today, today)
-        reply_text(
-            reply_token,
-            format_ranking(rows, today, today),
-        )
+
+        try:
+            rows = get_ranking(group_id, today, today)
+            reply_text(
+                reply_token,
+                format_ranking(rows, today, today),
+            )
+        except Exception:
+            logger.exception("오늘 마딧수 조회 실패")
+            reply_text(
+                reply_token,
+                "마딧수 조회 중 문제가 생겼어요. "
+                "잠시 후 다시 시도해 주세요.",
+            )
+
         return
 
+    # 기존 기간별 마딧수 명령어 유지
     date_range = parse_date_range(stripped)
+
     if date_range:
         start, end = date_range
-        rows = get_ranking(group_id, start, end)
-        reply_text(
-            reply_token,
-            format_ranking(rows, start, end),
-        )
+
+        try:
+            rows = get_ranking(group_id, start, end)
+            reply_text(
+                reply_token,
+                format_ranking(rows, start, end),
+            )
+        except Exception:
+            logger.exception("기간별 마딧수 조회 실패")
+            reply_text(
+                reply_token,
+                "마딧수 조회 중 문제가 생겼어요. "
+                "잠시 후 다시 시도해 주세요.",
+            )
+
         return
 
-    if stripped.startswith("집사 "):
-        question = stripped[len("집사 "):].strip()
-        if question:
-            reply_text(reply_token, gemini_answer(question))
-        return
-
-    if stripped.startswith("AI "):
-        question = stripped[len("AI "):].strip()
-        if question:
-            reply_text(reply_token, gemini_answer(question))
-        return
-
+    # 기존 !여초 / !남초 처리 유지
+    # 이 두 명령어는 아직 실제 멤버 검색 기능이 아닙니다.
     if stripped in ("!여초", "!남초"):
         reply_text(
             reply_token,
@@ -355,6 +480,25 @@ def handle_text(text, event, source):
             "LINE 그룹 멤버 조회 권한을 확인한 뒤 연결할게요.",
         )
         return
+
+    # 이제 !로 시작하는 메시지만 AI에게 전달합니다.
+    # 느낌표 뒤의 공백은 있어도 되고 없어도 됩니다.
+    if stripped.startswith("!"):
+        question = stripped[1:].strip()
+
+        # 느낌표만 입력한 경우에는 답변하지 않습니다.
+        if not question:
+            return
+
+        reply_text(
+            reply_token,
+            gemini_answer(question),
+        )
+
+        return
+
+    # !로 시작하지 않는 일반 채팅에는 답변하지 않습니다.
+    return
 
 
 @app.get("/")
@@ -387,19 +531,22 @@ def callback():
         source = event.get("source", {})
         message = event.get("message", {})
 
+        # 메시지 기록 오류가 나더라도 AI 답변 처리는
+        # 별도로 진행하도록 분리합니다.
         try:
-            # 텍스트, 스티커, 이미지 등 메시지 이벤트를 기록합니다.
             record_message(event, source, message)
+        except Exception:
+            logger.exception("메시지 기록 실패")
 
-            # 명령어와 AI 질문은 텍스트 메시지만 처리합니다.
-            if message.get("type") == "text":
+        if message.get("type") == "text":
+            try:
                 handle_text(
                     message.get("text", ""),
                     event,
                     source,
                 )
-        except Exception:
-            logger.exception("메시지 이벤트 처리 실패")
+            except Exception:
+                logger.exception("메시지 답변 처리 실패")
 
     return "OK", 200
 
