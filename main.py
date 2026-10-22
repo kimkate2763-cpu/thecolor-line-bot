@@ -23,7 +23,7 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 
 KEYWORDS = [
     "무무", "이리", "타워", "랜치",
@@ -40,6 +40,28 @@ SYSTEM_PROMPT = """
 Google 검색 결과를 바탕으로 답변해.
 검색으로 확인되지 않은 정보는 사실처럼 단정하지 마.
 """
+
+# 지정한 모델을 먼저 시도하고, 실패하면 다음 모델로 넘어갑니다.
+# 모델별 사용 가능 여부는 API 키와 Google AI Studio 프로젝트에 따라 달라집니다.
+GEMINI_MODEL_FALLBACKS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+]
+
+
+def get_gemini_models():
+    models = []
+
+    if GEMINI_MODEL:
+        models.append(GEMINI_MODEL)
+
+    models.extend(GEMINI_MODEL_FALLBACKS)
+
+    # 중복 모델 제거
+    return list(dict.fromkeys(models))
 
 
 def get_db():
@@ -178,7 +200,6 @@ def record_message(event, source, message):
     if not group_id or not user_id:
         return
 
-    # 메시지 기록 전에 테이블이 준비되어 있는지 확인합니다.
     ensure_database()
 
     source_type = source.get("type", "")
@@ -313,112 +334,142 @@ def format_ranking(rows, start, end):
 
 def gemini_answer(user_text):
     if not GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY가 설정되지 않았습니다.")
         return (
             "아직 AI 집사 연결이 완료되지 않았어요. "
-            "관리자가 Gemini API 설정을 마치면 대답할 수 있어요!"
+            "관리자가 Gemini API 키 설정을 확인해 주세요."
         )
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        + GEMINI_MODEL
-        + ":generateContent"
+    last_error = None
+
+    for model in get_gemini_models():
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            "v1beta/models/"
+            + model
+            + ":generateContent"
+        )
+
+        try:
+            logger.info("Gemini 모델 시도: %s", model)
+
+            response = requests.post(
+                url,
+                params={"key": GEMINI_API_KEY},
+                json={
+                    "systemInstruction": {
+                        "parts": [{"text": SYSTEM_PROMPT}]
+                    },
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [
+                                {"text": user_text[:4000]}
+                            ],
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "google_search": {}
+                        }
+                    ],
+                    "generationConfig": {
+                        "temperature": 0.8,
+                        "maxOutputTokens": 600,
+                    },
+                },
+                timeout=40,
+            )
+
+            if not response.ok:
+                last_error = (
+                    f"{model}: HTTP {response.status_code} "
+                    f"{response.text[:500]}"
+                )
+                logger.warning("Gemini 모델 실패: %s", last_error)
+                continue
+
+            data = response.json()
+            candidates = data.get("candidates", [])
+
+            if not candidates:
+                last_error = f"{model}: 응답 후보 없음"
+                logger.warning("%s", last_error)
+                continue
+
+            candidate = candidates[0]
+            parts = candidate.get("content", {}).get(
+                "parts", []
+            )
+
+            answer = "\n".join(
+                part.get("text", "")
+                for part in parts
+                if part.get("text")
+            ).strip()
+
+            if not answer:
+                last_error = f"{model}: 답변 텍스트 없음"
+                logger.warning("%s", last_error)
+                continue
+
+            metadata = candidate.get(
+                "groundingMetadata", {}
+            )
+            chunks = metadata.get("groundingChunks", [])
+
+            source_lines = []
+            seen_urls = set()
+
+            for chunk in chunks:
+                web_source = chunk.get("web", {})
+                uri = web_source.get("uri", "")
+                title = web_source.get("title", "")
+
+                if (
+                    uri.startswith("https://")
+                    and uri not in seen_urls
+                ):
+                    seen_urls.add(uri)
+                    source_lines.append(
+                        f"• {title or '참고 자료'}\n{uri}"
+                    )
+
+                if len(source_lines) >= 3:
+                    break
+
+            if source_lines:
+                answer += "\n\n🔎 참고 출처\n"
+                answer += "\n".join(source_lines)
+
+            logger.info("Gemini 답변 성공: %s", model)
+            return answer
+
+        except requests.exceptions.RequestException as exc:
+            last_error = f"{model}: {str(exc)}"
+            logger.exception("Gemini 통신 실패: %s", model)
+            continue
+
+        except (KeyError, ValueError, TypeError) as exc:
+            last_error = f"{model}: 응답 처리 오류: {str(exc)}"
+            logger.exception("Gemini 응답 처리 실패: %s", model)
+            continue
+
+        except Exception as exc:
+            last_error = f"{model}: {str(exc)}"
+            logger.exception("Gemini 모델 처리 실패: %s", model)
+            continue
+
+    logger.error(
+        "모든 Gemini 모델 실패. 마지막 오류: %s",
+        last_error,
     )
 
-    try:
-        response = requests.post(
-            url,
-            params={"key": GEMINI_API_KEY},
-            json={
-                "systemInstruction": {
-                    "parts": [{"text": SYSTEM_PROMPT}]
-                },
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [
-                            {"text": user_text[:4000]}
-                        ],
-                    }
-                ],
-                # Gemini가 질문에 필요한 경우 Google 검색을
-                # 직접 수행하도록 설정합니다.
-                "tools": [
-                    {
-                        "google_search": {}
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": 0.8,
-                    "maxOutputTokens": 600,
-                },
-            },
-            timeout=40,
-        )
-
-        response.raise_for_status()
-        data = response.json()
-
-        candidates = data.get("candidates", [])
-
-        if not candidates:
-            logger.error("Gemini 응답에 candidates가 없습니다.")
-            return (
-                "앗, 집사 답변을 가져오지 못했어요. "
-                "잠시 후 다시 말씀해 주세요."
-            )
-
-        candidate = candidates[0]
-        parts = candidate.get("content", {}).get("parts", [])
-
-        answer = "\n".join(
-            part.get("text", "")
-            for part in parts
-            if part.get("text")
-        ).strip()
-
-        if not answer:
-            return (
-                "앗, 집사 답변을 가져오지 못했어요. "
-                "질문을 조금 바꿔 다시 말씀해 주세요."
-            )
-
-        # 검색 출처가 반환되면 답변 끝에 함께 표시합니다.
-        metadata = candidate.get("groundingMetadata", {})
-        chunks = metadata.get("groundingChunks", [])
-
-        source_lines = []
-        seen_urls = set()
-
-        for chunk in chunks:
-            web_source = chunk.get("web", {})
-            uri = web_source.get("uri", "")
-            title = web_source.get("title", "")
-
-            if (
-                uri
-                and uri.startswith("https://")
-                and uri not in seen_urls
-            ):
-                seen_urls.add(uri)
-                source_lines.append(
-                    f"• {title or '참고 자료'}\n{uri}"
-                )
-
-            if len(source_lines) >= 3:
-                break
-
-        if source_lines:
-            answer += "\n\n🔎 참고 출처\n"
-            answer += "\n".join(source_lines)
-
-        return answer
-
-    except Exception:
-        logger.exception("Gemini API 요청 실패")
-        return (
-            "앗, 집사 답변을 가져오지 못했어요. "
-            "잠시 후 다시 말씀해 주세요."
-        )
+    return (
+        "집사가 여러 AI 모델에 연결해 봤지만 "
+        "이번에는 답변을 가져오지 못했어요. "
+        "잠시 후 다시 말씀해 주세요."
+    )
 
 
 def handle_text(text, event, source):
@@ -429,7 +480,6 @@ def handle_text(text, event, source):
     if not group_id:
         return
 
-    # 기존 마딧수 명령어 유지
     if stripped == "*마딧수":
         today = datetime.now(KST).date()
 
@@ -449,7 +499,6 @@ def handle_text(text, event, source):
 
         return
 
-    # 기존 기간별 마딧수 명령어 유지
     date_range = parse_date_range(stripped)
 
     if date_range:
@@ -471,8 +520,6 @@ def handle_text(text, event, source):
 
         return
 
-    # 기존 !여초 / !남초 처리 유지
-    # 이 두 명령어는 아직 실제 멤버 검색 기능이 아닙니다.
     if stripped in ("!여초", "!남초"):
         reply_text(
             reply_token,
@@ -481,12 +528,10 @@ def handle_text(text, event, source):
         )
         return
 
-    # 이제 !로 시작하는 메시지만 AI에게 전달합니다.
-    # 느낌표 뒤의 공백은 있어도 되고 없어도 됩니다.
+    # !로 시작하는 질문에만 AI가 답변합니다.
     if stripped.startswith("!"):
         question = stripped[1:].strip()
 
-        # 느낌표만 입력한 경우에는 답변하지 않습니다.
         if not question:
             return
 
@@ -494,10 +539,9 @@ def handle_text(text, event, source):
             reply_token,
             gemini_answer(question),
         )
-
         return
 
-    # !로 시작하지 않는 일반 채팅에는 답변하지 않습니다.
+    # 일반 채팅에는 답변하지 않습니다.
     return
 
 
@@ -531,8 +575,6 @@ def callback():
         source = event.get("source", {})
         message = event.get("message", {})
 
-        # 메시지 기록 오류가 나더라도 AI 답변 처리는
-        # 별도로 진행하도록 분리합니다.
         try:
             record_message(event, source, message)
         except Exception:
