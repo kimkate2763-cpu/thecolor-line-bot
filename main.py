@@ -14,6 +14,7 @@ from psycopg.rows import dict_row
 from flask import Flask, request, abort, jsonify
 
 app = Flask(__name__)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("thecolor-line-bot")
 
@@ -41,14 +42,14 @@ Google 검색 결과를 바탕으로 답변해.
 검색으로 확인되지 않은 정보는 사실처럼 단정하지 마.
 """
 
-# 지정한 모델을 먼저 시도하고, 실패하면 다음 모델로 넘어갑니다.
-# 모델별 사용 가능 여부는 API 키와 Google AI Studio 프로젝트에 따라 달라집니다.
+# 실제 사용 가능한 모델을 우선순위대로 시도합니다.
+# GEMINI_MODEL 환경 변수가 설정되어 있으면 해당 모델을 먼저 시도합니다.
 GEMINI_MODEL_FALLBACKS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
 ]
 
 
@@ -60,7 +61,6 @@ def get_gemini_models():
 
     models.extend(GEMINI_MODEL_FALLBACKS)
 
-    # 중복 모델 제거
     return list(dict.fromkeys(models))
 
 
@@ -353,12 +353,18 @@ def gemini_answer(user_text):
         try:
             logger.info("Gemini 모델 시도: %s", model)
 
+            # Gemini 3 계열 호환성을 위해 temperature 설정은 제외합니다.
             response = requests.post(
                 url,
-                params={"key": GEMINI_API_KEY},
+                headers={
+                    "x-goog-api-key": GEMINI_API_KEY,
+                    "Content-Type": "application/json",
+                },
                 json={
                     "systemInstruction": {
-                        "parts": [{"text": SYSTEM_PROMPT}]
+                        "parts": [
+                            {"text": SYSTEM_PROMPT}
+                        ]
                     },
                     "contents": [
                         {
@@ -374,7 +380,6 @@ def gemini_answer(user_text):
                         }
                     ],
                     "generationConfig": {
-                        "temperature": 0.8,
                         "maxOutputTokens": 600,
                     },
                 },
@@ -384,16 +389,23 @@ def gemini_answer(user_text):
             if not response.ok:
                 last_error = (
                     f"{model}: HTTP {response.status_code} "
-                    f"{response.text[:500]}"
+                    f"{response.text[:700]}"
                 )
-                logger.warning("Gemini 모델 실패: %s", last_error)
+
+                logger.warning(
+                    "Gemini 모델 실패: %s",
+                    last_error,
+                )
                 continue
 
             data = response.json()
             candidates = data.get("candidates", [])
 
             if not candidates:
-                last_error = f"{model}: 응답 후보 없음"
+                last_error = (
+                    f"{model}: 응답 후보 없음. "
+                    f"응답 내용: {str(data)[:500]}"
+                )
                 logger.warning("%s", last_error)
                 continue
 
@@ -409,7 +421,10 @@ def gemini_answer(user_text):
             ).strip()
 
             if not answer:
-                last_error = f"{model}: 답변 텍스트 없음"
+                last_error = (
+                    f"{model}: 답변 텍스트 없음. "
+                    f"finishReason={candidate.get('finishReason', 'unknown')}"
+                )
                 logger.warning("%s", last_error)
                 continue
 
@@ -442,22 +457,34 @@ def gemini_answer(user_text):
                 answer += "\n\n🔎 참고 출처\n"
                 answer += "\n".join(source_lines)
 
-            logger.info("Gemini 답변 성공: %s", model)
+            logger.info(
+                "Gemini 답변 성공: %s",
+                model,
+            )
             return answer
 
         except requests.exceptions.RequestException as exc:
-            last_error = f"{model}: {str(exc)}"
-            logger.exception("Gemini 통신 실패: %s", model)
+            last_error = f"{model}: 통신 오류: {str(exc)}"
+            logger.exception(
+                "Gemini 통신 실패: %s",
+                model,
+            )
             continue
 
         except (KeyError, ValueError, TypeError) as exc:
             last_error = f"{model}: 응답 처리 오류: {str(exc)}"
-            logger.exception("Gemini 응답 처리 실패: %s", model)
+            logger.exception(
+                "Gemini 응답 처리 실패: %s",
+                model,
+            )
             continue
 
         except Exception as exc:
-            last_error = f"{model}: {str(exc)}"
-            logger.exception("Gemini 모델 처리 실패: %s", model)
+            last_error = f"{model}: 예기치 않은 오류: {str(exc)}"
+            logger.exception(
+                "Gemini 모델 처리 실패: %s",
+                model,
+            )
             continue
 
     logger.error(
@@ -466,9 +493,8 @@ def gemini_answer(user_text):
     )
 
     return (
-        "집사가 여러 AI 모델에 연결해 봤지만 "
-        "이번에는 답변을 가져오지 못했어요. "
-        "잠시 후 다시 말씀해 주세요."
+        "집사가 답변을 가져오지 못했어요. 😿\n"
+        "관리자가 Render 로그에서 오류를 확인해야 해요."
     )
 
 
