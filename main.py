@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import logging
 import base64
+import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -27,19 +28,35 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 
+# 실제 LINE 프로필 이름과 정확히 일치해야 합니다.
+ADMIN_NAMES = [
+    "무무",
+    "이리",
+    "타워",
+    "렌치",
+    "절도",
+    "주음",
+    "꼬꼬",
+    "짜필",
+    "냠냠",
+]
+
 SYSTEM_PROMPT = """
-너는 LINE 단체방 '더컬러'의 친근하고 다정한 AI 집사야.
-자연스러운 한국어 존댓말을 사용해.
+너는 LINE 단체방 '더컬러'에서 활동하는 레드봇 2.0이야.
+너의 정체성은 레드봇 2.0이라는 AI 챗봇이야.
+자신을 AI 집사라고 소개하지 마.
+정체를 물으면 '나는 더컬러의 레드봇 2.0이야'라고 알려 줘.
+
+자연스럽고 친근한 한국어로 대화해.
 답변은 보통 1~4문장으로 간결하게 작성해.
-사용자의 감정을 먼저 이해하고, 필요할 때 실질적인 도움을 줘.
+사용자의 감정을 이해하고 필요할 때 실질적인 도움을 줘.
 확인하지 못한 방 규칙이나 사실을 지어내지 마.
-검색 자료가 제공되면 그 자료를 우선 참고해 답변해.
+검색 자료가 있으면 해당 자료를 우선 참고해.
 자료에 없는 내용은 확인된 사실처럼 단정하지 마.
-검색 자료의 URL을 답변에 그대로 길게 나열하지 말고,
-필요한 출처는 답변 끝에 간결하게 표시해.
+최신 정보를 검색하지 못했다면 솔직하게 알려 줘.
 """
 
-# 현재 공식적으로 제공되는 모델 ID를 우선 사용합니다.
+# 기존 모델 목록을 유지합니다.
 GEMINI_MODEL_FALLBACKS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
@@ -58,6 +75,10 @@ SEARCH_KEYWORDS = [
     "올해", "어제", "내일", "출처", "근황",
 ]
 
+_db_initialized = False
+profile_cache = {}
+PROFILE_CACHE_SECONDS = 21600
+
 
 def get_gemini_models():
     models = []
@@ -75,7 +96,6 @@ def should_search_web(user_text):
 
 
 def tavily_search(query):
-    """최신 정보가 필요한 질문에 한해 Tavily 검색을 실행합니다."""
     if not TAVILY_API_KEY:
         logger.info("TAVILY_API_KEY 미설정: 웹 검색 생략")
         return []
@@ -91,43 +111,36 @@ def tavily_search(query):
                 "include_answer": False,
                 "include_raw_content": False,
             },
-            timeout=15,
+            timeout=8,
         )
 
         if not response.ok:
             logger.warning(
                 "Tavily 검색 실패: HTTP %s %s",
                 response.status_code,
-                response.text[:400],
+                response.text[:300],
             )
             return []
 
         data = response.json()
-        results = data.get("results", [])
-
         cleaned = []
-        for item in results[:5]:
+
+        for item in data.get("results", [])[:5]:
             title = str(item.get("title", "")).strip()
             url = str(item.get("url", "")).strip()
             content = str(item.get("content", "")).strip()
 
-            if not content:
-                continue
+            if content:
+                cleaned.append({
+                    "title": title[:200],
+                    "url": url,
+                    "content": content[:1500],
+                })
 
-            cleaned.append({
-                "title": title[:200],
-                "url": url,
-                "content": content[:1800],
-            })
-
-        logger.info("Tavily 검색 성공: 결과 %s개", len(cleaned))
         return cleaned
 
-    except requests.exceptions.RequestException:
-        logger.exception("Tavily 통신 오류")
-        return []
-    except (ValueError, TypeError):
-        logger.exception("Tavily 응답 처리 오류")
+    except (requests.exceptions.RequestException, ValueError, TypeError):
+        logger.exception("Tavily 검색 오류")
         return []
 
 
@@ -135,22 +148,19 @@ def build_search_context(results):
     if not results:
         return "", []
 
-    context_lines = [
-        "다음은 웹 검색 결과입니다.",
-        "검색 결과가 질문과 관련 있는지 판단한 뒤 사용하세요.",
-    ]
+    lines = ["웹 검색 결과:"]
     sources = []
 
     for index, item in enumerate(results, start=1):
-        context_lines.append(
+        lines.append(
             f"\n[{index}] {item['title']}\n{item['content']}"
         )
 
         url = item["url"]
-        if url.startswith("https://") or url.startswith("http://"):
+        if url.startswith(("https://", "http://")):
             sources.append((item["title"] or "참고 자료", url))
 
-    return "\n".join(context_lines), sources
+    return "\n".join(lines), sources
 
 
 def get_db():
@@ -164,9 +174,6 @@ def get_db():
         row_factory=dict_row,
         connect_timeout=10,
     )
-
-
-_db_initialized = False
 
 
 def init_database():
@@ -217,7 +224,7 @@ def verify_signature(body, signature):
     return hmac.compare_digest(expected, signature)
 
 
-def line_api(method, endpoint, payload=None):
+def line_api(method, endpoint, payload=None, timeout=8):
     if not LINE_CHANNEL_ACCESS_TOKEN:
         raise RuntimeError(
             "LINE access token이 설정되지 않았습니다."
@@ -231,7 +238,7 @@ def line_api(method, endpoint, payload=None):
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=15,
+        timeout=timeout,
     )
 
     response.raise_for_status()
@@ -273,6 +280,31 @@ def get_member_profile(group_id, user_id, source_type):
         return None
 
 
+def get_cached_profile(group_id, user_id, source_type):
+    key = (group_id, user_id)
+    now = time.time()
+
+    cached = profile_cache.get(key)
+
+    if cached and now - cached["time"] < PROFILE_CACHE_SECONDS:
+        return cached["name"]
+
+    profile = get_member_profile(group_id, user_id, source_type)
+    name = (profile or {}).get("displayName")
+
+    if name:
+        profile_cache[key] = {
+            "name": name,
+            "time": now,
+        }
+        return name
+
+    if cached:
+        return cached["name"]
+
+    return "이름 확인 불가"
+
+
 def record_message(event, source, message):
     group_id = source.get("groupId") or source.get("roomId")
     user_id = source.get("userId")
@@ -282,14 +314,10 @@ def record_message(event, source, message):
 
     ensure_database()
 
-    profile = get_member_profile(
+    display_name = get_cached_profile(
         group_id,
         user_id,
         source.get("type", ""),
-    )
-
-    display_name = (
-        (profile or {}).get("displayName") or "이름 확인 불가"
     )
 
     event_id = event.get("webhookEventId") or message.get("id")
@@ -324,6 +352,130 @@ def record_message(event, source, message):
                 message.get("type", "unknown"), created_at,
             ),
         )
+
+
+def get_admin_user_ids(group_id):
+    """
+    기존 DB에서 관리자 프로필 이름과 LINE 사용자 ID를 찾습니다.
+    최신 프로필 이름이 관리자 명단과 정확히 일치하는 경우만 사용합니다.
+    """
+    ensure_database()
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT ON (user_id)
+                   user_id, display_name
+            FROM message_events
+            WHERE group_id = %s
+            ORDER BY user_id, created_at DESC
+            """,
+            (group_id,),
+        ).fetchall()
+
+    ids_by_name = {}
+
+    for row in rows:
+        name = (row["display_name"] or "").strip()
+        user_id = row["user_id"]
+
+        if name and name != "이름 확인 불가":
+            ids_by_name.setdefault(name, set()).add(user_id)
+
+    resolved = []
+    missing = []
+    ambiguous = []
+
+    for name in ADMIN_NAMES:
+        ids = ids_by_name.get(name, set())
+
+        if not ids:
+            missing.append(name)
+        elif len(ids) > 1:
+            ambiguous.append(name)
+        else:
+            resolved.append((name, next(iter(ids))))
+
+    return resolved, missing, ambiguous
+
+
+def reply_admin_mentions(reply_token, group_id, suffix):
+    if not reply_token:
+        return
+
+    resolved, missing, ambiguous = get_admin_user_ids(group_id)
+
+    # 일부 관리자만 발견되었을 때는 잘못된 결과를 보내지 않습니다.
+    if missing or ambiguous or len(resolved) != len(ADMIN_NAMES):
+        lines = ["관리자 ID 확인 결과"]
+
+        if resolved:
+            lines.append(
+                "DB에서 확인된 이름: "
+                + ", ".join(name for name, _ in resolved)
+            )
+
+        if missing:
+            lines.append(
+                "DB에서 찾지 못한 이름: "
+                + ", ".join(missing)
+            )
+
+        if ambiguous:
+            lines.append(
+                "이름이 중복된 항목: "
+                + ", ".join(ambiguous)
+            )
+
+        lines.append(
+            "누락된 관리자가 이 방에서 메시지를 보냈는지, "
+            "LINE 프로필 이름이 명단과 정확히 일치하는지 확인해 주세요."
+        )
+
+        reply_text(reply_token, "\n".join(lines))
+        return
+
+    # LINE textV2의 실제 멘션 형식으로 전송합니다.
+    substitutions = {}
+    mention_text = []
+
+    for index, (name, user_id) in enumerate(resolved, start=1):
+        key = f"admin{index}"
+        mention_text.append("{" + key + "}")
+
+        substitutions[key] = {
+            "type": "mention",
+            "mentionee": {
+                "type": "user",
+                "userId": user_id,
+            },
+        }
+
+    message_text = " ".join(mention_text) + "\n" + suffix
+
+    try:
+        line_api(
+            "POST",
+            "/v2/bot/message/reply",
+            {
+                "replyToken": reply_token,
+                "messages": [{
+                    "type": "textV2",
+                    "text": message_text,
+                    "substitution": substitutions,
+                }],
+            },
+        )
+
+        logger.info(
+            "관리자 멘션 전송 성공: group=%s suffix=%s",
+            group_id,
+            suffix,
+        )
+
+    except requests.exceptions.HTTPError:
+        logger.exception("관리자 멘션 전송 실패")
+        raise
 
 
 def parse_date_range(text):
@@ -397,18 +549,16 @@ def gemini_answer(user_text):
     if not GEMINI_API_KEY:
         logger.error("GEMINI_API_KEY가 설정되지 않았습니다.")
         return (
-            "아직 AI 집사 연결이 완료되지 않았어요. "
+            "아직 레드봇 2.0의 AI 연결이 완료되지 않았어요. "
             "관리자가 Gemini API 키 설정을 확인해 주세요."
         )
 
-    # 최신 정보가 필요한 질문만 외부 검색합니다.
-    search_results = []
-    if should_search_web(user_text):
-        search_results = tavily_search(user_text)
-
+    needs_search = should_search_web(user_text)
+    search_results = tavily_search(user_text) if needs_search else []
     search_context, sources = build_search_context(search_results)
 
     prompt = user_text[:3500]
+
     if search_context:
         prompt += (
             "\n\n[웹 검색 참고 자료]\n"
@@ -416,11 +566,10 @@ def gemini_answer(user_text):
             + "\n\n검색 자료를 근거로 답변하고, 자료에 없는 내용은 "
               "확실하다고 단정하지 마세요."
         )
-    elif should_search_web(user_text):
+    elif needs_search:
         prompt += (
             "\n\n웹 검색 결과를 가져오지 못했습니다. "
-            "최신 정보를 확인한 것처럼 말하지 말고, "
-            "확인할 수 없다고 솔직하게 알려 주세요."
+            "최신 정보를 확인한 것처럼 말하지 마세요."
         )
 
     last_error = None
@@ -449,29 +598,23 @@ def gemini_answer(user_text):
                         "parts": [{"text": prompt}]
                     }],
                     "generationConfig": {
-                        "maxOutputTokens": 600
+                        "maxOutputTokens": 500
                     },
                 },
-                timeout=40,
+                timeout=30,
             )
 
             if not response.ok:
                 last_error = (
                     f"{model}: HTTP {response.status_code} "
-                    f"{response.text[:700]}"
+                    f"{response.text[:500]}"
                 )
                 logger.warning("Gemini 모델 실패: %s", last_error)
 
-                # 429는 사용량/비율 제한일 수 있습니다.
-                # 같은 요청을 여러 모델로 반복하지 않습니다.
                 if response.status_code == 429:
-                    logger.error(
-                        "Gemini 429 한도 오류. 모델 반복 시도를 중단합니다."
-                    )
+                    logger.error("Gemini 429 한도 오류")
                     break
 
-                # 모델 ID가 잘못됐거나 접근할 수 없는 경우는
-                # 다음 모델을 시도할 수 있습니다.
                 continue
 
             data = response.json()
@@ -479,7 +622,6 @@ def gemini_answer(user_text):
 
             if not candidates:
                 last_error = f"{model}: 응답 후보 없음"
-                logger.warning("%s", last_error)
                 continue
 
             candidate = candidates[0]
@@ -492,11 +634,7 @@ def gemini_answer(user_text):
             ).strip()
 
             if not answer:
-                last_error = (
-                    f"{model}: 답변 텍스트 없음. "
-                    f"finishReason={candidate.get('finishReason', 'unknown')}"
-                )
-                logger.warning("%s", last_error)
+                last_error = f"{model}: 답변 텍스트 없음"
                 continue
 
             if sources:
@@ -506,8 +644,10 @@ def gemini_answer(user_text):
                 for title, uri in sources:
                     if uri in seen_urls:
                         continue
+
                     seen_urls.add(uri)
                     source_lines.append(f"• {title}\n{uri}")
+
                     if len(source_lines) >= 3:
                         break
 
@@ -535,14 +675,13 @@ def gemini_answer(user_text):
 
     if last_error and "HTTP 429" in last_error:
         return (
-            "집사가 지금 AI 사용 한도에 걸렸어요. 😿\n"
-            "잠시 후 다시 시도해 주세요. 계속되면 관리자가 "
-            "Google AI Studio의 모델별 한도를 확인해야 해요."
+            "AI 사용 한도에 도달했어요. 😿\n"
+            "잠시 후 다시 시도해 주세요."
         )
 
     return (
-        "집사가 답변을 가져오지 못했어요. 😿\n"
-        "관리자가 Render 로그에서 오류를 확인해야 해요."
+        "답변을 가져오지 못했어요. 😿\n"
+        "관리자가 Render 로그에서 오류를 확인해 주세요."
     )
 
 
@@ -556,6 +695,7 @@ def handle_text(text, event, source):
 
     if stripped == "*마딧수":
         today = datetime.now(KST).date()
+
         try:
             rows = get_ranking(group_id, today, today)
             reply_text(reply_token, format_ranking(rows, today, today))
@@ -568,8 +708,10 @@ def handle_text(text, event, source):
         return
 
     date_range = parse_date_range(stripped)
+
     if date_range:
         start, end = date_range
+
         try:
             rows = get_ranking(group_id, start, end)
             reply_text(reply_token, format_ranking(rows, start, end))
@@ -581,23 +723,23 @@ def handle_text(text, event, source):
             )
         return
 
-    if stripped in ("!여초", "!남초"):
-        reply_text(
-            reply_token,
-            "이 명령어의 실제 멤버 검색 및 멘션 기능은 "
-            "LINE 그룹 멤버 조회 권한을 확인한 뒤 연결할게요.",
-        )
+    if stripped == "*여초":
+        reply_admin_mentions(reply_token, group_id, "여초1")
         return
 
-    # !로 시작하는 질문에만 AI가 답변합니다.
+    if stripped == "*남초":
+        reply_admin_mentions(reply_token, group_id, "남초1")
+        return
+
+    # 기존처럼 !로 시작하는 질문에만 AI가 답변합니다.
     if stripped.startswith("!"):
         question = stripped[1:].strip()
+
         if not question:
             return
+
         reply_text(reply_token, gemini_answer(question))
         return
-
-    # 일반 채팅에는 답변하지 않습니다.
 
 
 @app.get("/")
@@ -605,12 +747,16 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "thecolor-line-bot",
+        "identity": "레드봇 2.0",
     })
 
 
 @app.get("/health")
 def health_check():
-    return jsonify({"status": "healthy"})
+    return jsonify({
+        "status": "healthy",
+        "identity": "레드봇 2.0",
+    })
 
 
 @app.post("/callback")
