@@ -34,57 +34,56 @@ ADMIN_NAMES = [
     "주음", "꼬꼬", "짜필", "냠냠",
 ]
 
-# 최근 대화를 사용자별로 기억합니다.
-# 10턴 = 사용자 질문 10개 + AI 답변 최대 10개
 MAX_HISTORY_TURNS = 10
 conversation_histories = {}
 history_lock = Lock()
 
-# 프로필 캐시
 profile_cache = {}
 PROFILE_CACHE_SECONDS = 21600
 
-# 한도 초과 모델의 재요청을 줄이기 위한 임시 기록
-# 프로세스가 재시작되면 초기화됩니다.
 model_cooldowns = {}
 cooldown_lock = Lock()
 
 SYSTEM_PROMPT = """
 너는 LINE 단체방 '더컬러'에서 활동하는 레드봇 2.0이야.
-너는 AI 챗봇이며, 자신을 AI 집사나 다른 봇으로 소개하지 마.
+자신을 AI 집사나 다른 봇으로 소개하지 마.
 정체를 물으면 '나는 더컬러의 레드봇 2.0이야'라고 알려 줘.
 
 [대화 방식]
 - 자연스럽고 친근한 한국어로 대화해.
 - 딱딱한 상담원이나 검색 요약기처럼 말하지 마.
 - 상대방의 말투와 분위기를 적절히 맞춰.
-- 가벼운 잡담, 심심하다는 말, 메뉴 추천, 취향 이야기,
-  고민 상담, 감정 표현, 장난스러운 대화에도 자연스럽게 반응해.
-- 사용자가 앞서 말한 내용을 고려해 대화를 이어가.
-- 이전 대화에서 이미 답한 내용을 무시하거나 같은 질문을
-  반복하지 마.
+- 잡담, 메뉴 추천, 취향 이야기, 고민 상담, 감정 표현,
+  장난스러운 대화에도 자연스럽게 반응해.
+- 이전 대화 내용을 고려해서 대화를 이어가.
+- 이미 답한 질문을 반복하거나 앞선 대화 내용을 무시하지 마.
 - 매번 답변 끝에 억지로 질문을 붙이지 마.
-- 과장된 칭찬, 지나친 위로, 뻔한 문구를 반복하지 마.
-- 사용자가 속상한 일을 말하면 먼저 감정을 이해하고,
+- 과장된 칭찬이나 뻔한 위로를 반복하지 마.
+- 사용자가 속상한 일을 말하면 먼저 감정을 이해하고
   상황에 맞는 반응이나 실질적인 도움을 제공해.
 
-[답변 길이 - 반드시 지킬 것]
-- 평소 답변은 보통 1~2줄로 짧게 작성해.
-- 설명이 필요한 질문도 최대 5~7줄 이내로 작성해.
-- 단순한 질문에는 핵심만 바로 답하고 불필요한 설명을 덧붙이지 마.
+[답변 길이]
+- 평소 답변은 보통 1~2줄로 작성해.
+- 설명이 필요하면 최대 5~7줄 정도로 간결하게 답해.
+- 짧게 답하라는 것은 문장을 중간에 끊으라는 뜻이 아니야.
+- 답변 길이를 줄이더라도 핵심 문장과 설명을 완성해.
+- 답변을 전송하기 전에 모든 문장이 끝까지 완성되었는지 확인해.
+- 문장 중간에서 끊긴 채 답변을 끝내지 마.
+- 답변이 길어질 것 같으면 문장을 잘라 버리지 말고
+  처음부터 핵심만 간결하게 표현해.
+- 한 문장으로 충분하면 한 문장으로 답해.
 - 긴 서론, 결론, 요약, 반복 설명을 붙이지 마.
 - 목록은 여러 항목을 비교하거나 정리해야 할 때만 사용해.
-- 같은 내용을 다른 말로 반복해서 분량을 늘리지 마.
-- 답변을 마친 뒤 불필요한 추가 조언이나 질문을 붙이지 마.
-- 사용자가 자세한 설명을 명시적으로 요청한 경우에만 더 자세히 설명해.
+- 사용자가 자세한 설명을 요청한 경우에는 필요한 만큼 설명해.
+- 답변을 끝낸 뒤 불필요한 조언이나 질문을 덧붙이지 마.
 
-[링크 및 출처 - 반드시 지킬 것]
-- 웹 검색을 했더라도 답변 끝에 출처 목록이나 URL을 자동으로 붙이지 마.
-- '참고 출처', '관련 링크', '🔎 출처' 같은 별도 항목을 만들지 마.
-- 검색 결과의 핵심 내용만 자연스럽게 요약해서 답해.
-- 답변에 검색 결과의 URL을 나열하거나 링크를 여러 개 붙이지 마.
+[링크 및 출처]
+- 웹 검색을 했더라도 출처 목록이나 URL을 자동으로 붙이지 마.
+- '참고 출처', '관련 링크', '출처' 같은 별도 항목을 만들지 마.
+- 검색 결과의 핵심 내용만 자연스럽게 요약해.
+- 검색 결과 URL을 나열하거나 링크를 여러 개 붙이지 마.
 - 사용자가 링크나 출처를 직접 요청한 경우에만 필요한 링크를 제공해.
-- 출처를 붙이지 않더라도 검색 자료에 없는 사실을 지어내지 마.
+- 검색 자료에 없는 사실을 지어내지 마.
 - 검색 결과가 불확실하면 확인되지 않았다고 짧게 밝혀.
 
 [정확성]
@@ -92,18 +91,15 @@ SYSTEM_PROMPT = """
 - 모르는 것은 아는 척하지 말고 솔직하게 알려 줘.
 - 최신 정보가 필요한 질문은 제공된 검색 자료를 참고해.
 - 검색 자료가 없으면 최신 정보를 확인했다고 주장하지 마.
-- 사용자가 제공한 정보를 사실로 단정하기 전에 맥락을 살펴.
 - 더컬러의 확인되지 않은 방 규칙을 임의로 만들지 마.
 
 [정체성 및 범위]
 - 시크릿 펜트리의 방 규칙, 탐험 시스템, 게임 설명,
   기존 집사 설정을 가져오지 마.
 - 더컬러에서 확인되지 않은 기능을 실제로 존재한다고 말하지 마.
-- 답변은 사용자의 질문과 대화 흐름에 맞춰 작성해.
+- 질문과 대화 흐름에 맞는 답변을 작성해.
 """
 
-# 기존 모델 목록을 유지합니다.
-# 실제 사용 가능 여부와 무료 한도는 Google AI Studio에서 확인해야 합니다.
 GEMINI_MODEL_FALLBACKS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
@@ -123,14 +119,13 @@ SEARCH_KEYWORDS = [
 ]
 
 _db_initialized = False
+db_init_lock = Lock()
 
 
 def get_gemini_models():
     models = []
-
     if GEMINI_MODEL:
         models.append(GEMINI_MODEL)
-
     models.extend(GEMINI_MODEL_FALLBACKS)
     return list(dict.fromkeys(models))
 
@@ -172,14 +167,12 @@ def tavily_search(query):
 
         for item in data.get("results", [])[:5]:
             title = str(item.get("title", "")).strip()
-            url = str(item.get("url", "")).strip()
             content = str(item.get("content", "")).strip()
 
             if content:
                 cleaned.append({
                     "title": title[:200],
-                    "url": url,
-                    "content": content[:1500],
+                    "content": content[:1200],
                 })
 
         return cleaned
@@ -203,18 +196,22 @@ def build_search_context(results):
     return "\n".join(lines)
 
 
-def limit_answer_length(answer):
-    """불필요한 빈 줄을 정리하고 답변을 최대 7줄로 제한합니다."""
+def clean_answer(answer):
+    """불필요한 빈 줄만 정리하며 답변 문장을 임의로 자르지 않습니다."""
     answer = str(answer or "").strip()
+    lines = [line.rstrip() for line in answer.splitlines()]
+    cleaned = []
+    blank_before = False
 
-    # 앞뒤의 불필요한 빈 줄을 제거합니다.
-    lines = [line.strip() for line in answer.splitlines() if line.strip()]
+    for line in lines:
+        if line.strip():
+            cleaned.append(line.strip())
+            blank_before = False
+        elif cleaned and not blank_before:
+            cleaned.append("")
+            blank_before = True
 
-    # 줄 수가 지나치게 길면 최대 7줄까지만 전송합니다.
-    if len(lines) > 7:
-        lines = lines[:7]
-
-    return "\n".join(lines).strip()[:4500]
+    return "\n".join(cleaned).strip()
 
 
 def get_db():
@@ -260,8 +257,11 @@ def ensure_database():
     if _db_initialized:
         return
 
-    init_database()
-    _db_initialized = True
+    with db_init_lock:
+        if _db_initialized:
+            return
+        init_database()
+        _db_initialized = True
 
 
 def verify_signature(body, signature):
@@ -307,7 +307,10 @@ def reply_text(reply_token, text):
     if not reply_token:
         return
 
-    text = str(text)[:4500]
+    text = str(text).strip()[:4500]
+
+    if not text:
+        text = "답변을 만들지 못했어요. 다시 질문해 주세요."
 
     line_api(
         "POST",
@@ -337,7 +340,6 @@ def get_member_profile(group_id, user_id, source_type):
 def get_cached_profile(group_id, user_id, source_type):
     key = (group_id, user_id)
     now = time.time()
-
     cached = profile_cache.get(key)
 
     if cached and now - cached["time"] < PROFILE_CACHE_SECONDS:
@@ -347,10 +349,7 @@ def get_cached_profile(group_id, user_id, source_type):
     name = (profile or {}).get("displayName")
 
     if name:
-        profile_cache[key] = {
-            "name": name,
-            "time": now,
-        }
+        profile_cache[key] = {"name": name, "time": now}
         return name
 
     if cached:
@@ -490,7 +489,6 @@ def reply_admin_mentions(reply_token, group_id, suffix):
     for index, (name, user_id) in enumerate(resolved, start=1):
         key = f"admin{index}"
         mention_text.append("{" + key + "}")
-
         substitutions[key] = {
             "type": "mention",
             "mentionee": {
@@ -522,7 +520,7 @@ def reply_admin_mentions(reply_token, group_id, suffix):
 
 
 def parse_date_range(text):
-    match = re.search(
+    match = re.fullmatch(
         r"\*(\d{4}-\d{2}-\d{2})\s*~\s*"
         r"(\d{4}-\d{2}-\d{2})\s*마딧수",
         text.strip(),
@@ -558,13 +556,14 @@ def get_ranking(group_id, start, end):
     with get_db() as conn:
         rows = conn.execute(
             """
-            SELECT user_id, display_name, COUNT(*) AS message_count
+            SELECT user_id, MAX(display_name) AS display_name,
+                   COUNT(*) AS message_count
             FROM message_events
             WHERE group_id = %s
               AND created_at >= %s
               AND created_at < %s
-            GROUP BY user_id, display_name
-            ORDER BY message_count DESC, display_name ASC
+            GROUP BY user_id
+            ORDER BY message_count DESC, LOWER(MAX(display_name)) ASC
             LIMIT 30
             """,
             (group_id, start_dt, end_dt),
@@ -615,6 +614,7 @@ def save_conversation_turn(group_id, user_id, question, answer):
         })
 
         max_messages = MAX_HISTORY_TURNS * 2
+
         if len(history) > max_messages:
             del history[:-max_messages]
 
@@ -657,15 +657,16 @@ def gemini_answer(user_text, group_id, user_id, display_name=""):
         prompt += (
             "\n\n[웹 검색 참고 자료]\n"
             + search_context[:8000]
-            + "\n\n검색 자료를 근거로 핵심 내용만 짧게 답변하세요. "
-            "URL이나 출처 목록은 답변에 붙이지 마세요. "
+            + "\n\n검색 자료를 바탕으로 핵심만 간결하게 답변하세요. "
+            "URL이나 출처 목록은 붙이지 마세요. "
+            "문장을 중간에 끊지 말고 완성된 문장으로 끝내세요. "
             "자료에 없는 내용은 확실하다고 단정하지 마세요."
         )
     elif needs_search:
         prompt += (
             "\n\n웹 검색 결과를 가져오지 못했습니다. "
             "최신 정보를 확인한 것처럼 말하지 마세요. "
-            "짧고 간결하게 답변하세요."
+            "간결하고 완성된 문장으로 답변하세요."
         )
 
     system_prompt = SYSTEM_PROMPT
@@ -708,109 +709,138 @@ def gemini_answer(user_text, group_id, user_id, display_name=""):
             "v1beta/models/" + model + ":generateContent"
         )
 
-        try:
-            logger.info(
-                "Gemini 모델 시도: %s, 이전 대화 메시지 수: %s",
-                model,
-                len(history),
-            )
+        # 첫 요청에서 답변이 토큰 한도로 끊기면 같은 모델로 한 번 더 시도합니다.
+        for attempt in range(2):
+            max_tokens = 800 if attempt == 0 else 1400
 
-            response = requests.post(
-                url,
-                headers={
-                    "x-goog-api-key": GEMINI_API_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "systemInstruction": {
-                        "parts": [{"text": system_prompt}]
-                    },
-                    "contents": contents,
-                    "generationConfig": {
-                        "maxOutputTokens": 400,
-                        "temperature": 0.7,
-                    },
-                },
-                timeout=30,
-            )
-
-            if not response.ok:
-                last_error = (
-                    f"{model}: HTTP {response.status_code} "
-                    f"{response.text[:500]}"
+            try:
+                logger.info(
+                    "Gemini 모델 시도: %s, attempt=%s, history=%s",
+                    model,
+                    attempt + 1,
+                    len(history),
                 )
-                logger.warning("Gemini 모델 실패: %s", last_error)
 
-                if response.status_code == 429:
-                    wait_seconds = parse_retry_seconds(response.text)
+                response = requests.post(
+                    url,
+                    headers={
+                        "x-goog-api-key": GEMINI_API_KEY,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "systemInstruction": {
+                            "parts": [{"text": system_prompt}]
+                        },
+                        "contents": contents,
+                        "generationConfig": {
+                            "maxOutputTokens": max_tokens,
+                            "temperature": 0.7,
+                        },
+                    },
+                    timeout=35,
+                )
 
-                    with cooldown_lock:
-                        model_cooldowns[model] = (
-                            time.time() + wait_seconds
+                if not response.ok:
+                    last_error = (
+                        f"{model}: HTTP {response.status_code} "
+                        f"{response.text[:500]}"
+                    )
+                    logger.warning("Gemini 모델 실패: %s", last_error)
+
+                    if response.status_code == 429:
+                        wait_seconds = parse_retry_seconds(response.text)
+
+                        with cooldown_lock:
+                            model_cooldowns[model] = (
+                                time.time() + wait_seconds
+                            )
+
+                        saw_quota_error = True
+                        logger.warning(
+                            "모델 %s 한도 초과: %s초 대기",
+                            model,
+                            wait_seconds,
                         )
+                    break
 
-                    saw_quota_error = True
+                data = response.json()
+                candidates = data.get("candidates", [])
 
+                if not candidates:
+                    last_error = f"{model}: 응답 후보 없음"
+                    logger.warning("%s", last_error)
+                    break
+
+                candidate = candidates[0]
+                finish_reason = candidate.get("finishReason", "")
+                parts = candidate.get("content", {}).get("parts", [])
+
+                answer = "\n".join(
+                    part.get("text", "")
+                    for part in parts
+                    if part.get("text")
+                ).strip()
+
+                if not answer:
+                    last_error = (
+                        f"{model}: 답변 텍스트 없음 "
+                        f"(finishReason={finish_reason})"
+                    )
+                    logger.warning("%s", last_error)
+                    break
+
+                # MAX_TOKENS는 응답이 잘렸을 가능성이 있으므로
+                # 불완전한 답변을 보내지 않고 더 큰 한도로 재시도합니다.
+                if finish_reason == "MAX_TOKENS" and attempt == 0:
                     logger.warning(
-                        "모델 %s 한도 초과: 약 %s초 대기 후 재시도 가능",
+                        "%s 답변이 토큰 한도에 도달해 재시도합니다.",
                         model,
-                        wait_seconds,
                     )
                     continue
 
-                continue
+                if finish_reason == "MAX_TOKENS":
+                    logger.warning(
+                        "%s 재시도 후에도 토큰 한도에 도달했습니다.",
+                        model,
+                    )
+                    last_error = f"{model}: 답변이 토큰 한도로 종료됨"
+                    break
 
-            data = response.json()
-            candidates = data.get("candidates", [])
+                answer = clean_answer(answer)
 
-            if not candidates:
-                last_error = f"{model}: 응답 후보 없음"
-                logger.warning("%s", last_error)
-                continue
+                if not answer:
+                    last_error = f"{model}: 정리 후 답변이 비어 있음"
+                    break
 
-            candidate = candidates[0]
-            parts = candidate.get("content", {}).get("parts", [])
+                # 출처 URL을 덧붙이지 않으며, 문장을 임의로 자르지 않습니다.
+                save_conversation_turn(
+                    group_id,
+                    user_id,
+                    user_text,
+                    answer,
+                )
 
-            answer = "\n".join(
-                part.get("text", "")
-                for part in parts
-                if part.get("text")
-            ).strip()
+                logger.info(
+                    "Gemini 답변 성공: %s (finishReason=%s)",
+                    model,
+                    finish_reason,
+                )
+                return answer[:4500]
 
-            if not answer:
-                last_error = f"{model}: 답변 텍스트 없음"
-                continue
+            except requests.exceptions.RequestException as exc:
+                last_error = f"{model}: 통신 오류: {str(exc)}"
+                logger.exception("Gemini 통신 실패: %s", model)
+                break
 
-            # 답변 길이를 제한하고 빈 줄을 정리합니다.
-            # 검색 URL 및 출처 목록은 자동으로 추가하지 않습니다.
-            answer = limit_answer_length(answer)
+            except (KeyError, ValueError, TypeError) as exc:
+                last_error = f"{model}: 응답 처리 오류: {str(exc)}"
+                logger.exception("Gemini 응답 처리 실패: %s", model)
+                break
 
-            # 성공한 답변만 대화 기록에 저장합니다.
-            # 검색 결과 원문은 대화 기록에 저장하지 않습니다.
-            save_conversation_turn(
-                group_id,
-                user_id,
-                user_text,
-                answer,
-            )
-
-            logger.info("Gemini 답변 성공: %s", model)
-            return answer
-
-        except requests.exceptions.RequestException as exc:
-            last_error = f"{model}: 통신 오류: {str(exc)}"
-            logger.exception("Gemini 통신 실패: %s", model)
-            continue
-
-        except (KeyError, ValueError, TypeError) as exc:
-            last_error = f"{model}: 응답 처리 오류: {str(exc)}"
-            logger.exception("Gemini 응답 처리 실패: %s", model)
-            continue
-
-        except Exception as exc:
-            last_error = f"{model}: 예기치 않은 오류: {str(exc)}"
-            logger.exception("Gemini 모델 처리 실패: %s", model)
-            continue
+            except Exception as exc:
+                last_error = f"{model}: 예기치 않은 오류: {str(exc)}"
+                logger.exception("Gemini 모델 처리 실패: %s", model)
+                break
 
     logger.error("Gemini 모델 요청 실패: %s", last_error)
 
@@ -821,8 +851,8 @@ def gemini_answer(user_text, group_id, user_id, display_name=""):
         )
 
     return (
-        "답변을 가져오지 못했어요. 😿\n"
-        "잠시 후 다시 시도해 주세요."
+        "답변을 완성하지 못했어요. 😿\n"
+        "잠시 후 다시 질문해 주세요."
     )
 
 
@@ -835,7 +865,6 @@ def handle_text(text, event, source):
     if not group_id:
         return
 
-    # 기존 마딧수 명령어
     if stripped == "*마딧수":
         today = datetime.now(KST).date()
 
@@ -866,7 +895,6 @@ def handle_text(text, event, source):
             )
         return
 
-    # 기존 관리자 멘션 기능
     if stripped == "*여초":
         reply_admin_mentions(reply_token, group_id, "여초1")
         return
@@ -875,7 +903,6 @@ def handle_text(text, event, source):
         reply_admin_mentions(reply_token, group_id, "남초1")
         return
 
-    # 기존처럼 !로 시작하는 질문에만 AI가 답변합니다.
     if stripped.startswith("!"):
         question = stripped[1:].strip()
 
@@ -902,7 +929,6 @@ def handle_text(text, event, source):
             display_name,
         )
         reply_text(reply_token, answer)
-        return
 
 
 @app.get("/")
@@ -940,19 +966,17 @@ def callback():
         message = event.get("message", {})
 
         try:
-            record_message(event, source, message)
-        except Exception:
-            logger.exception("메시지 기록 실패")
-
-        if message.get("type") == "text":
-            try:
+            if message.get("type") == "text":
+                record_message(event, source, message)
                 handle_text(
                     message.get("text", ""),
                     event,
                     source,
                 )
-            except Exception:
-                logger.exception("메시지 답변 처리 실패")
+            else:
+                record_message(event, source, message)
+        except Exception:
+            logger.exception("메시지 처리 실패")
 
     return "OK", 200
 
