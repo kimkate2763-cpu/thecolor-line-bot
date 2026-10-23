@@ -6,6 +6,7 @@ import hashlib
 import logging
 import base64
 import time
+import random
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -28,17 +29,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 
-# 실제 LINE 프로필 이름과 정확히 일치해야 합니다.
 ADMIN_NAMES = [
-    "무무",
-    "이리",
-    "타워",
-    "렌치",
-    "절도",
-    "주음",
-    "꼬꼬",
-    "짜필",
-    "냠냠",
+    "무무", "이리", "타워", "렌치", "절도",
+    "주음", "꼬꼬", "짜필", "냠냠",
 ]
 
 SYSTEM_PROMPT = """
@@ -79,6 +72,28 @@ _db_initialized = False
 profile_cache = {}
 PROFILE_CACHE_SECONDS = 21600
 
+# 모델별 한도 초과 시각을 기억합니다.
+# Render 프로세스가 재시작되면 초기화됩니다.
+model_cooldowns = {}
+
+# 간단한 일상 질문은 AI API를 호출하지 않고 처리합니다.
+BALANCE_QUESTIONS = [
+    "평생 여름 vs 평생 겨울",
+    "하루 동안 투명인간 vs 하루 동안 순간이동",
+    "매일 치킨 먹기 vs 매일 피자 먹기",
+    "과거로 돌아가기 vs 미래로 가기",
+    "읽씹 당하기 vs 안읽씹 당하기",
+    "평생 전화만 하기 vs 평생 문자만 하기",
+    "돈 많은 백수 vs 좋아하는 일 하며 평범하게 살기",
+    "친구 100명 vs 진짜 친한 친구 1명",
+]
+
+LUNCH_MENUS = [
+    "김치찌개", "제육볶음", "돈가스", "마라탕",
+    "국밥", "초밥", "쌀국수", "햄버거",
+    "파스타", "떡볶이", "순두부찌개", "덮밥",
+]
+
 
 def get_gemini_models():
     models = []
@@ -93,6 +108,44 @@ def get_gemini_models():
 def should_search_web(user_text):
     text = user_text.lower()
     return any(keyword in text for keyword in SEARCH_KEYWORDS)
+
+
+def get_quick_answer(user_text):
+    """
+    고정형 일상 질문만 로컬에서 처리합니다.
+    그 외 자유 대화는 Gemini로 전달합니다.
+    """
+    text = re.sub(r"\s+", " ", user_text.strip().lower())
+
+    if any(word in text for word in [
+        "밸런스 게임", "밸런스게임", "밸런스 질문",
+    ]):
+        return "🎲 밸런스 게임!\n\n" + random.choice(
+            BALANCE_QUESTIONS
+        )
+
+    if any(word in text for word in [
+        "점메추", "점심 메뉴 추천", "점심추천",
+        "뭐 먹지", "뭐먹지", "메뉴 추천",
+    ]):
+        return "🍚 오늘의 메뉴 추천!\n\n" + random.choice(
+            LUNCH_MENUS
+        ) + "\n이거 먹어 보는 건 어때?"
+
+    if any(word in text for word in [
+        "나 심심해", "심심한데", "심심해 뭐해",
+        "뭐하고 놀지", "뭐 하고 놀지",
+    ]):
+        choices = [
+            "🎮 밸런스 게임 한 판 어때?",
+            "🗣️ 공창에서 서로 첫인상 말하기!",
+            "🤔 서로의 취향 맞히기 게임!",
+            "😂 지금 생각나는 웃긴 일 하나씩 풀기!",
+            "💬 다 같이 이상형 월드컵 해 보자!",
+        ]
+        return random.choice(choices)
+
+    return None
 
 
 def tavily_search(query):
@@ -355,10 +408,6 @@ def record_message(event, source, message):
 
 
 def get_admin_user_ids(group_id):
-    """
-    기존 DB에서 관리자 프로필 이름과 LINE 사용자 ID를 찾습니다.
-    최신 프로필 이름이 관리자 명단과 정확히 일치하는 경우만 사용합니다.
-    """
     ensure_database()
 
     with get_db() as conn:
@@ -405,7 +454,6 @@ def reply_admin_mentions(reply_token, group_id, suffix):
 
     resolved, missing, ambiguous = get_admin_user_ids(group_id)
 
-    # 일부 관리자만 발견되었을 때는 잘못된 결과를 보내지 않습니다.
     if missing or ambiguous or len(resolved) != len(ADMIN_NAMES):
         lines = ["관리자 ID 확인 결과"]
 
@@ -435,7 +483,6 @@ def reply_admin_mentions(reply_token, group_id, suffix):
         reply_text(reply_token, "\n".join(lines))
         return
 
-    # LINE textV2의 실제 멘션 형식으로 전송합니다.
     substitutions = {}
     mention_text = []
 
@@ -453,29 +500,24 @@ def reply_admin_mentions(reply_token, group_id, suffix):
 
     message_text = " ".join(mention_text) + "\n" + suffix
 
-    try:
-        line_api(
-            "POST",
-            "/v2/bot/message/reply",
-            {
-                "replyToken": reply_token,
-                "messages": [{
-                    "type": "textV2",
-                    "text": message_text,
-                    "substitution": substitutions,
-                }],
-            },
-        )
+    line_api(
+        "POST",
+        "/v2/bot/message/reply",
+        {
+            "replyToken": reply_token,
+            "messages": [{
+                "type": "textV2",
+                "text": message_text,
+                "substitution": substitutions,
+            }],
+        },
+    )
 
-        logger.info(
-            "관리자 멘션 전송 성공: group=%s suffix=%s",
-            group_id,
-            suffix,
-        )
-
-    except requests.exceptions.HTTPError:
-        logger.exception("관리자 멘션 전송 실패")
-        raise
+    logger.info(
+        "관리자 멘션 전송 성공: group=%s suffix=%s",
+        group_id,
+        suffix,
+    )
 
 
 def parse_date_range(text):
@@ -545,6 +587,31 @@ def format_ranking(rows, start, end):
     return "\n".join(lines)
 
 
+def parse_retry_seconds(response_text):
+    """
+    응답 본문에 'retry in 3h29m7s'와 비슷한 문구가
+    있을 경우 대기 시간을 초 단위로 변환합니다.
+    파싱할 수 없으면 기본 1시간을 사용합니다.
+    """
+    match = re.search(
+        r"retry in\s+"
+        r"(?:(\d+)h)?\s*"
+        r"(?:(\d+)m)?\s*"
+        r"(?:(\d+(?:\.\d+)?)s)?",
+        response_text,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        return 3600
+
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = float(match.group(3) or 0)
+
+    return max(60, int(hours * 3600 + minutes * 60 + seconds))
+
+
 def gemini_answer(user_text):
     if not GEMINI_API_KEY:
         logger.error("GEMINI_API_KEY가 설정되지 않았습니다.")
@@ -552,6 +619,12 @@ def gemini_answer(user_text):
             "아직 레드봇 2.0의 AI 연결이 완료되지 않았어요. "
             "관리자가 Gemini API 키 설정을 확인해 주세요."
         )
+
+    # 먼저 API가 필요 없는 간단한 질문인지 확인합니다.
+    quick_answer = get_quick_answer(user_text)
+    if quick_answer:
+        logger.info("로컬 일상 답변 사용: Gemini 호출 생략")
+        return quick_answer
 
     needs_search = should_search_web(user_text)
     search_results = tavily_search(user_text) if needs_search else []
@@ -572,9 +645,24 @@ def gemini_answer(user_text):
             "최신 정보를 확인한 것처럼 말하지 마세요."
         )
 
-    last_error = None
+    now = time.time()
+    models = get_gemini_models()
+    available_models = [
+        model for model in models
+        if model_cooldowns.get(model, 0) <= now
+    ]
 
-    for model in get_gemini_models():
+    if not available_models:
+        logger.warning("사용 가능한 Gemini 모델이 모두 대기 상태입니다.")
+        return (
+            "AI가 잠시 쉬고 있어요. 😿\n"
+            "무료 사용 한도가 회복된 뒤 다시 질문해 주세요."
+        )
+
+    last_error = None
+    saw_quota_error = False
+
+    for model in available_models:
         url = (
             "https://generativelanguage.googleapis.com/"
             "v1beta/models/" + model + ":generateContent"
@@ -612,9 +700,19 @@ def gemini_answer(user_text):
                 logger.warning("Gemini 모델 실패: %s", last_error)
 
                 if response.status_code == 429:
-                    logger.error("Gemini 429 한도 오류")
-                    break
+                    # 이 모델은 당분간 재호출하지 않고 다음 모델을 시도합니다.
+                    wait_seconds = parse_retry_seconds(response.text)
+                    model_cooldowns[model] = time.time() + wait_seconds
+                    saw_quota_error = True
 
+                    logger.warning(
+                        "모델 %s 한도 초과: 약 %s초 동안 대기",
+                        model,
+                        wait_seconds,
+                    )
+                    continue
+
+                # 모델 이름이나 요청 형식 오류 등은 다음 모델을 시도합니다.
                 continue
 
             data = response.json()
@@ -624,9 +722,7 @@ def gemini_answer(user_text):
                 last_error = f"{model}: 응답 후보 없음"
                 continue
 
-            candidate = candidates[0]
-            parts = candidate.get("content", {}).get("parts", [])
-
+            parts = candidates[0].get("content", {}).get("parts", [])
             answer = "\n".join(
                 part.get("text", "")
                 for part in parts
@@ -662,10 +758,12 @@ def gemini_answer(user_text):
             last_error = f"{model}: 통신 오류: {str(exc)}"
             logger.exception("Gemini 통신 실패: %s", model)
             continue
+
         except (KeyError, ValueError, TypeError) as exc:
             last_error = f"{model}: 응답 처리 오류: {str(exc)}"
             logger.exception("Gemini 응답 처리 실패: %s", model)
             continue
+
         except Exception as exc:
             last_error = f"{model}: 예기치 않은 오류: {str(exc)}"
             logger.exception("Gemini 모델 처리 실패: %s", model)
@@ -673,10 +771,10 @@ def gemini_answer(user_text):
 
     logger.error("Gemini 모델 요청 실패: %s", last_error)
 
-    if last_error and "HTTP 429" in last_error:
+    if saw_quota_error:
         return (
             "AI 사용 한도에 도달했어요. 😿\n"
-            "잠시 후 다시 시도해 주세요."
+            "다른 무료 모델도 사용할 수 없어 잠시 후 다시 시도해 주세요."
         )
 
     return (
