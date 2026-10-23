@@ -67,11 +67,25 @@ SYSTEM_PROMPT = """
 - 과장된 칭찬, 지나친 위로, 뻔한 문구를 반복하지 마.
 - 사용자가 속상한 일을 말하면 먼저 감정을 이해하고,
   상황에 맞는 반응이나 실질적인 도움을 제공해.
-- 필요 이상으로 긴 서론이나 결론을 쓰지 마.
-- 일반적인 답변은 자연스러운 길이로 작성하되,
-  설명이 필요한 질문은 충분히 설명해.
-- 짧은 질문이라고 무조건 한 문장으로 끝내지 마.
-- 사용자가 후속 질문을 하면 이전 대화의 맥락을 반영해.
+
+[답변 길이 - 반드시 지킬 것]
+- 평소 답변은 보통 1~2줄로 짧게 작성해.
+- 설명이 필요한 질문도 최대 5~7줄 이내로 작성해.
+- 단순한 질문에는 핵심만 바로 답하고 불필요한 설명을 덧붙이지 마.
+- 긴 서론, 결론, 요약, 반복 설명을 붙이지 마.
+- 목록은 여러 항목을 비교하거나 정리해야 할 때만 사용해.
+- 같은 내용을 다른 말로 반복해서 분량을 늘리지 마.
+- 답변을 마친 뒤 불필요한 추가 조언이나 질문을 붙이지 마.
+- 사용자가 자세한 설명을 명시적으로 요청한 경우에만 더 자세히 설명해.
+
+[링크 및 출처 - 반드시 지킬 것]
+- 웹 검색을 했더라도 답변 끝에 출처 목록이나 URL을 자동으로 붙이지 마.
+- '참고 출처', '관련 링크', '🔎 출처' 같은 별도 항목을 만들지 마.
+- 검색 결과의 핵심 내용만 자연스럽게 요약해서 답해.
+- 답변에 검색 결과의 URL을 나열하거나 링크를 여러 개 붙이지 마.
+- 사용자가 링크나 출처를 직접 요청한 경우에만 필요한 링크를 제공해.
+- 출처를 붙이지 않더라도 검색 자료에 없는 사실을 지어내지 마.
+- 검색 결과가 불확실하면 확인되지 않았다고 짧게 밝혀.
 
 [정확성]
 - 확인하지 못한 사실이나 규칙을 지어내지 마.
@@ -177,21 +191,30 @@ def tavily_search(query):
 
 def build_search_context(results):
     if not results:
-        return "", []
+        return ""
 
     lines = ["웹 검색 결과:"]
-    sources = []
 
     for index, item in enumerate(results, start=1):
         lines.append(
             f"\n[{index}] {item['title']}\n{item['content']}"
         )
 
-        url = item["url"]
-        if url.startswith(("https://", "http://")):
-            sources.append((item["title"] or "참고 자료", url))
+    return "\n".join(lines)
 
-    return "\n".join(lines), sources
+
+def limit_answer_length(answer):
+    """불필요한 빈 줄을 정리하고 답변을 최대 7줄로 제한합니다."""
+    answer = str(answer or "").strip()
+
+    # 앞뒤의 불필요한 빈 줄을 제거합니다.
+    lines = [line.strip() for line in answer.splitlines() if line.strip()]
+
+    # 줄 수가 지나치게 길면 최대 7줄까지만 전송합니다.
+    if len(lines) > 7:
+        lines = lines[:7]
+
+    return "\n".join(lines).strip()[:4500]
 
 
 def get_db():
@@ -626,7 +649,7 @@ def gemini_answer(user_text, group_id, user_id, display_name=""):
 
     needs_search = should_search_web(user_text)
     search_results = tavily_search(user_text) if needs_search else []
-    search_context, sources = build_search_context(search_results)
+    search_context = build_search_context(search_results)
 
     prompt = user_text[:3500]
 
@@ -634,13 +657,15 @@ def gemini_answer(user_text, group_id, user_id, display_name=""):
         prompt += (
             "\n\n[웹 검색 참고 자료]\n"
             + search_context[:8000]
-            + "\n\n검색 자료를 근거로 답변하고, 자료에 없는 내용은 "
-            "확실하다고 단정하지 마세요."
+            + "\n\n검색 자료를 근거로 핵심 내용만 짧게 답변하세요. "
+            "URL이나 출처 목록은 답변에 붙이지 마세요. "
+            "자료에 없는 내용은 확실하다고 단정하지 마세요."
         )
     elif needs_search:
         prompt += (
             "\n\n웹 검색 결과를 가져오지 못했습니다. "
-            "최신 정보를 확인한 것처럼 말하지 마세요."
+            "최신 정보를 확인한 것처럼 말하지 마세요. "
+            "짧고 간결하게 답변하세요."
         )
 
     system_prompt = SYSTEM_PROMPT
@@ -652,7 +677,6 @@ def gemini_answer(user_text, group_id, user_id, display_name=""):
             + "입니다. 이름을 부르는 것이 자연스러울 때만 사용하세요."
         )
 
-    # 현재 사용자의 최근 대화 기록을 가져옵니다.
     history = get_conversation_history(group_id, user_id)
 
     contents = history + [{
@@ -703,7 +727,8 @@ def gemini_answer(user_text, group_id, user_id, display_name=""):
                     },
                     "contents": contents,
                     "generationConfig": {
-                        "maxOutputTokens": 700
+                        "maxOutputTokens": 400,
+                        "temperature": 0.7,
                     },
                 },
                 timeout=30,
@@ -756,26 +781,12 @@ def gemini_answer(user_text, group_id, user_id, display_name=""):
                 last_error = f"{model}: 답변 텍스트 없음"
                 continue
 
-            if sources:
-                source_lines = []
-                seen_urls = set()
-
-                for title, uri in sources:
-                    if uri in seen_urls:
-                        continue
-
-                    seen_urls.add(uri)
-                    source_lines.append(f"• {title}\n{uri}")
-
-                    if len(source_lines) >= 3:
-                        break
-
-                if source_lines:
-                    answer += "\n\n🔎 참고 출처\n"
-                    answer += "\n".join(source_lines)
+            # 답변 길이를 제한하고 빈 줄을 정리합니다.
+            # 검색 URL 및 출처 목록은 자동으로 추가하지 않습니다.
+            answer = limit_answer_length(answer)
 
             # 성공한 답변만 대화 기록에 저장합니다.
-            # 검색 결과 원문이 아니라 사용자의 질문과 최종 답변을 저장합니다.
+            # 검색 결과 원문은 대화 기록에 저장하지 않습니다.
             save_conversation_turn(
                 group_id,
                 user_id,
@@ -811,7 +822,7 @@ def gemini_answer(user_text, group_id, user_id, display_name=""):
 
     return (
         "답변을 가져오지 못했어요. 😿\n"
-        "관리자가 Render 로그에서 오류를 확인해 주세요."
+        "잠시 후 다시 시도해 주세요."
     )
 
 
