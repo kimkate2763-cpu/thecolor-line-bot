@@ -6,9 +6,9 @@ import hashlib
 import logging
 import base64
 import time
-import random
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
+from threading import Lock
 
 import requests
 import psycopg
@@ -34,22 +34,62 @@ ADMIN_NAMES = [
     "주음", "꼬꼬", "짜필", "냠냠",
 ]
 
+# 최근 대화를 사용자별로 기억합니다.
+# 10턴 = 사용자 질문 10개 + AI 답변 최대 10개
+MAX_HISTORY_TURNS = 10
+conversation_histories = {}
+history_lock = Lock()
+
+# 프로필 캐시
+profile_cache = {}
+PROFILE_CACHE_SECONDS = 21600
+
+# 한도 초과 모델의 재요청을 줄이기 위한 임시 기록
+# 프로세스가 재시작되면 초기화됩니다.
+model_cooldowns = {}
+cooldown_lock = Lock()
+
 SYSTEM_PROMPT = """
 너는 LINE 단체방 '더컬러'에서 활동하는 레드봇 2.0이야.
-너의 정체성은 레드봇 2.0이라는 AI 챗봇이야.
-자신을 AI 집사라고 소개하지 마.
+너는 AI 챗봇이며, 자신을 AI 집사나 다른 봇으로 소개하지 마.
 정체를 물으면 '나는 더컬러의 레드봇 2.0이야'라고 알려 줘.
 
-자연스럽고 친근한 한국어로 대화해.
-답변은 보통 1~4문장으로 간결하게 작성해.
-사용자의 감정을 이해하고 필요할 때 실질적인 도움을 줘.
-확인하지 못한 방 규칙이나 사실을 지어내지 마.
-검색 자료가 있으면 해당 자료를 우선 참고해.
-자료에 없는 내용은 확인된 사실처럼 단정하지 마.
-최신 정보를 검색하지 못했다면 솔직하게 알려 줘.
+[대화 방식]
+- 자연스럽고 친근한 한국어로 대화해.
+- 딱딱한 상담원이나 검색 요약기처럼 말하지 마.
+- 상대방의 말투와 분위기를 적절히 맞춰.
+- 가벼운 잡담, 심심하다는 말, 메뉴 추천, 취향 이야기,
+  고민 상담, 감정 표현, 장난스러운 대화에도 자연스럽게 반응해.
+- 사용자가 앞서 말한 내용을 고려해 대화를 이어가.
+- 이전 대화에서 이미 답한 내용을 무시하거나 같은 질문을
+  반복하지 마.
+- 매번 답변 끝에 억지로 질문을 붙이지 마.
+- 과장된 칭찬, 지나친 위로, 뻔한 문구를 반복하지 마.
+- 사용자가 속상한 일을 말하면 먼저 감정을 이해하고,
+  상황에 맞는 반응이나 실질적인 도움을 제공해.
+- 필요 이상으로 긴 서론이나 결론을 쓰지 마.
+- 일반적인 답변은 자연스러운 길이로 작성하되,
+  설명이 필요한 질문은 충분히 설명해.
+- 짧은 질문이라고 무조건 한 문장으로 끝내지 마.
+- 사용자가 후속 질문을 하면 이전 대화의 맥락을 반영해.
+
+[정확성]
+- 확인하지 못한 사실이나 규칙을 지어내지 마.
+- 모르는 것은 아는 척하지 말고 솔직하게 알려 줘.
+- 최신 정보가 필요한 질문은 제공된 검색 자료를 참고해.
+- 검색 자료가 없으면 최신 정보를 확인했다고 주장하지 마.
+- 사용자가 제공한 정보를 사실로 단정하기 전에 맥락을 살펴.
+- 더컬러의 확인되지 않은 방 규칙을 임의로 만들지 마.
+
+[정체성 및 범위]
+- 시크릿 펜트리의 방 규칙, 탐험 시스템, 게임 설명,
+  기존 집사 설정을 가져오지 마.
+- 더컬러에서 확인되지 않은 기능을 실제로 존재한다고 말하지 마.
+- 답변은 사용자의 질문과 대화 흐름에 맞춰 작성해.
 """
 
 # 기존 모델 목록을 유지합니다.
+# 실제 사용 가능 여부와 무료 한도는 Google AI Studio에서 확인해야 합니다.
 GEMINI_MODEL_FALLBACKS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
@@ -69,30 +109,6 @@ SEARCH_KEYWORDS = [
 ]
 
 _db_initialized = False
-profile_cache = {}
-PROFILE_CACHE_SECONDS = 21600
-
-# 모델별 한도 초과 시각을 기억합니다.
-# Render 프로세스가 재시작되면 초기화됩니다.
-model_cooldowns = {}
-
-# 간단한 일상 질문은 AI API를 호출하지 않고 처리합니다.
-BALANCE_QUESTIONS = [
-    "평생 여름 vs 평생 겨울",
-    "하루 동안 투명인간 vs 하루 동안 순간이동",
-    "매일 치킨 먹기 vs 매일 피자 먹기",
-    "과거로 돌아가기 vs 미래로 가기",
-    "읽씹 당하기 vs 안읽씹 당하기",
-    "평생 전화만 하기 vs 평생 문자만 하기",
-    "돈 많은 백수 vs 좋아하는 일 하며 평범하게 살기",
-    "친구 100명 vs 진짜 친한 친구 1명",
-]
-
-LUNCH_MENUS = [
-    "김치찌개", "제육볶음", "돈가스", "마라탕",
-    "국밥", "초밥", "쌀국수", "햄버거",
-    "파스타", "떡볶이", "순두부찌개", "덮밥",
-]
 
 
 def get_gemini_models():
@@ -108,44 +124,6 @@ def get_gemini_models():
 def should_search_web(user_text):
     text = user_text.lower()
     return any(keyword in text for keyword in SEARCH_KEYWORDS)
-
-
-def get_quick_answer(user_text):
-    """
-    고정형 일상 질문만 로컬에서 처리합니다.
-    그 외 자유 대화는 Gemini로 전달합니다.
-    """
-    text = re.sub(r"\s+", " ", user_text.strip().lower())
-
-    if any(word in text for word in [
-        "밸런스 게임", "밸런스게임", "밸런스 질문",
-    ]):
-        return "🎲 밸런스 게임!\n\n" + random.choice(
-            BALANCE_QUESTIONS
-        )
-
-    if any(word in text for word in [
-        "점메추", "점심 메뉴 추천", "점심추천",
-        "뭐 먹지", "뭐먹지", "메뉴 추천",
-    ]):
-        return "🍚 오늘의 메뉴 추천!\n\n" + random.choice(
-            LUNCH_MENUS
-        ) + "\n이거 먹어 보는 건 어때?"
-
-    if any(word in text for word in [
-        "나 심심해", "심심한데", "심심해 뭐해",
-        "뭐하고 놀지", "뭐 하고 놀지",
-    ]):
-        choices = [
-            "🎮 밸런스 게임 한 판 어때?",
-            "🗣️ 공창에서 서로 첫인상 말하기!",
-            "🤔 서로의 취향 맞히기 게임!",
-            "😂 지금 생각나는 웃긴 일 하나씩 풀기!",
-            "💬 다 같이 이상형 월드컵 해 보자!",
-        ]
-        return random.choice(choices)
-
-    return None
 
 
 def tavily_search(query):
@@ -587,12 +565,38 @@ def format_ranking(rows, start, end):
     return "\n".join(lines)
 
 
+def get_history_key(group_id, user_id):
+    return (group_id, user_id)
+
+
+def get_conversation_history(group_id, user_id):
+    key = get_history_key(group_id, user_id)
+
+    with history_lock:
+        return list(conversation_histories.get(key, []))
+
+
+def save_conversation_turn(group_id, user_id, question, answer):
+    key = get_history_key(group_id, user_id)
+
+    with history_lock:
+        history = conversation_histories.setdefault(key, [])
+
+        history.append({
+            "role": "user",
+            "parts": [{"text": question[:3500]}],
+        })
+        history.append({
+            "role": "model",
+            "parts": [{"text": answer[:4500]}],
+        })
+
+        max_messages = MAX_HISTORY_TURNS * 2
+        if len(history) > max_messages:
+            del history[:-max_messages]
+
+
 def parse_retry_seconds(response_text):
-    """
-    응답 본문에 'retry in 3h29m7s'와 비슷한 문구가
-    있을 경우 대기 시간을 초 단위로 변환합니다.
-    파싱할 수 없으면 기본 1시간을 사용합니다.
-    """
     match = re.search(
         r"retry in\s+"
         r"(?:(\d+)h)?\s*"
@@ -612,19 +616,13 @@ def parse_retry_seconds(response_text):
     return max(60, int(hours * 3600 + minutes * 60 + seconds))
 
 
-def gemini_answer(user_text):
+def gemini_answer(user_text, group_id, user_id, display_name=""):
     if not GEMINI_API_KEY:
         logger.error("GEMINI_API_KEY가 설정되지 않았습니다.")
         return (
             "아직 레드봇 2.0의 AI 연결이 완료되지 않았어요. "
             "관리자가 Gemini API 키 설정을 확인해 주세요."
         )
-
-    # 먼저 API가 필요 없는 간단한 질문인지 확인합니다.
-    quick_answer = get_quick_answer(user_text)
-    if quick_answer:
-        logger.info("로컬 일상 답변 사용: Gemini 호출 생략")
-        return quick_answer
 
     needs_search = should_search_web(user_text)
     search_results = tavily_search(user_text) if needs_search else []
@@ -637,7 +635,7 @@ def gemini_answer(user_text):
             "\n\n[웹 검색 참고 자료]\n"
             + search_context[:8000]
             + "\n\n검색 자료를 근거로 답변하고, 자료에 없는 내용은 "
-              "확실하다고 단정하지 마세요."
+            "확실하다고 단정하지 마세요."
         )
     elif needs_search:
         prompt += (
@@ -645,18 +643,36 @@ def gemini_answer(user_text):
             "최신 정보를 확인한 것처럼 말하지 마세요."
         )
 
+    system_prompt = SYSTEM_PROMPT
+
+    if display_name and display_name != "이름 확인 불가":
+        system_prompt += (
+            "\n현재 대화 상대의 LINE 표시 이름은 "
+            + display_name[:80]
+            + "입니다. 이름을 부르는 것이 자연스러울 때만 사용하세요."
+        )
+
+    # 현재 사용자의 최근 대화 기록을 가져옵니다.
+    history = get_conversation_history(group_id, user_id)
+
+    contents = history + [{
+        "role": "user",
+        "parts": [{"text": prompt}],
+    }]
+
     now = time.time()
-    models = get_gemini_models()
-    available_models = [
-        model for model in models
-        if model_cooldowns.get(model, 0) <= now
-    ]
+
+    with cooldown_lock:
+        available_models = [
+            model for model in get_gemini_models()
+            if model_cooldowns.get(model, 0) <= now
+        ]
 
     if not available_models:
         logger.warning("사용 가능한 Gemini 모델이 모두 대기 상태입니다.")
         return (
-            "AI가 잠시 쉬고 있어요. 😿\n"
-            "무료 사용 한도가 회복된 뒤 다시 질문해 주세요."
+            "AI 사용 한도가 잠시 막혀 있어요. 😿\n"
+            "무료 한도가 회복된 뒤 다시 질문해 주세요."
         )
 
     last_error = None
@@ -669,7 +685,11 @@ def gemini_answer(user_text):
         )
 
         try:
-            logger.info("Gemini 모델 시도: %s", model)
+            logger.info(
+                "Gemini 모델 시도: %s, 이전 대화 메시지 수: %s",
+                model,
+                len(history),
+            )
 
             response = requests.post(
                 url,
@@ -679,14 +699,11 @@ def gemini_answer(user_text):
                 },
                 json={
                     "systemInstruction": {
-                        "parts": [{"text": SYSTEM_PROMPT}]
+                        "parts": [{"text": system_prompt}]
                     },
-                    "contents": [{
-                        "role": "user",
-                        "parts": [{"text": prompt}]
-                    }],
+                    "contents": contents,
                     "generationConfig": {
-                        "maxOutputTokens": 500
+                        "maxOutputTokens": 700
                     },
                 },
                 timeout=30,
@@ -700,19 +717,22 @@ def gemini_answer(user_text):
                 logger.warning("Gemini 모델 실패: %s", last_error)
 
                 if response.status_code == 429:
-                    # 이 모델은 당분간 재호출하지 않고 다음 모델을 시도합니다.
                     wait_seconds = parse_retry_seconds(response.text)
-                    model_cooldowns[model] = time.time() + wait_seconds
+
+                    with cooldown_lock:
+                        model_cooldowns[model] = (
+                            time.time() + wait_seconds
+                        )
+
                     saw_quota_error = True
 
                     logger.warning(
-                        "모델 %s 한도 초과: 약 %s초 동안 대기",
+                        "모델 %s 한도 초과: 약 %s초 대기 후 재시도 가능",
                         model,
                         wait_seconds,
                     )
                     continue
 
-                # 모델 이름이나 요청 형식 오류 등은 다음 모델을 시도합니다.
                 continue
 
             data = response.json()
@@ -720,9 +740,12 @@ def gemini_answer(user_text):
 
             if not candidates:
                 last_error = f"{model}: 응답 후보 없음"
+                logger.warning("%s", last_error)
                 continue
 
-            parts = candidates[0].get("content", {}).get("parts", [])
+            candidate = candidates[0]
+            parts = candidate.get("content", {}).get("parts", [])
+
             answer = "\n".join(
                 part.get("text", "")
                 for part in parts
@@ -751,6 +774,15 @@ def gemini_answer(user_text):
                     answer += "\n\n🔎 참고 출처\n"
                     answer += "\n".join(source_lines)
 
+            # 성공한 답변만 대화 기록에 저장합니다.
+            # 검색 결과 원문이 아니라 사용자의 질문과 최종 답변을 저장합니다.
+            save_conversation_turn(
+                group_id,
+                user_id,
+                user_text,
+                answer,
+            )
+
             logger.info("Gemini 답변 성공: %s", model)
             return answer
 
@@ -774,7 +806,7 @@ def gemini_answer(user_text):
     if saw_quota_error:
         return (
             "AI 사용 한도에 도달했어요. 😿\n"
-            "다른 무료 모델도 사용할 수 없어 잠시 후 다시 시도해 주세요."
+            "사용 가능한 무료 모델이 없어 잠시 후 다시 시도해 주세요."
         )
 
     return (
@@ -785,12 +817,14 @@ def gemini_answer(user_text):
 
 def handle_text(text, event, source):
     group_id = source.get("groupId") or source.get("roomId")
+    user_id = source.get("userId")
     reply_token = event.get("replyToken")
     stripped = text.strip()
 
     if not group_id:
         return
 
+    # 기존 마딧수 명령어
     if stripped == "*마딧수":
         today = datetime.now(KST).date()
 
@@ -821,6 +855,7 @@ def handle_text(text, event, source):
             )
         return
 
+    # 기존 관리자 멘션 기능
     if stripped == "*여초":
         reply_admin_mentions(reply_token, group_id, "여초1")
         return
@@ -836,7 +871,26 @@ def handle_text(text, event, source):
         if not question:
             return
 
-        reply_text(reply_token, gemini_answer(question))
+        if not user_id:
+            reply_text(
+                reply_token,
+                "사용자 정보를 확인하지 못했어요. 다시 시도해 주세요.",
+            )
+            return
+
+        display_name = get_cached_profile(
+            group_id,
+            user_id,
+            source.get("type", ""),
+        )
+
+        answer = gemini_answer(
+            question,
+            group_id,
+            user_id,
+            display_name,
+        )
+        reply_text(reply_token, answer)
         return
 
 
