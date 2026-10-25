@@ -45,10 +45,14 @@ ADMIN_NAMES = [
     "꼬꼬",
     "짜필",
     "냠냠",
+    "유주",
 ]
 
 MAX_HISTORY_TURNS = 10
 PROFILE_CACHE_SECONDS = 21600
+PROFILE_FAILURE_CACHE_SECONDS = 60
+GEMINI_REQUEST_TIMEOUT = 9
+MODEL_COOLDOWN_SECONDS = 90
 
 conversation_histories = {}
 history_lock = Lock()
@@ -64,16 +68,19 @@ db_init_lock = Lock()
 
 # Gemini 모델은 환경변수 GEMINI_MODEL로 우선 지정 가능
 DEFAULT_GEMINI_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
     "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
 ]
 
 SYSTEM_PROMPT = """
-너는 더컬러 단체 채팅방의 친근하고 다정한 AI 집사다.
+너는 더컬러 단체 채팅방의 AI 캐릭터 '레드봇 2.0'이다.
 
+- 자기 이름은 반드시 '레드봇 2.0'이라고 한다.
+- 자신을 '집사', 'AI 집사', '집사님'이라고 부르거나 소개하지 않는다.
+- 사용자가 누구냐고 물으면 '저는 레드봇 2.0이에요.'라고 답한다.
 - 기본적으로 자연스럽고 친근한 한국어 존댓말을 사용한다.
 - 일반 질문에는 핵심부터 답하고 불필요하게 길게 말하지 않는다.
 - 질문에 필요한 설명은 빠뜨리지 않고 완결된 문장으로 답한다.
@@ -192,7 +199,7 @@ def line_api(endpoint, payload):
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=15,
+        timeout=8,
     )
 
     if not response.ok:
@@ -217,13 +224,17 @@ def reply_text(reply_token, text):
 
     text = text[:4900]
 
-    line_api("message/reply", {
-        "replyToken": reply_token,
-        "messages": [{
-            "type": "text",
-            "text": text,
-        }],
-    })
+    try:
+        line_api("message/reply", {
+            "replyToken": reply_token,
+            "messages": [{
+                "type": "text",
+                "text": text,
+            }],
+        })
+        logger.info("LINE 답장 전송 성공")
+    except Exception:
+        logger.exception("LINE 답장 전송 실패")
 
 
 def reply_text_v2(reply_token, text, substitutions):
@@ -274,12 +285,12 @@ def get_member_profile(group_id, user_id):
         response = requests.get(
             (
                 "https://api.line.me/v2/bot/group/"
-                f"{group_id}/members/{user_id}"
+                f"{group_id}/member/{user_id}"
             ),
             headers={
                 "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
             },
-            timeout=10,
+            timeout=4,
         )
 
         if not response.ok:
@@ -310,17 +321,27 @@ def get_cached_profile(group_id, user_id):
 
     with profile_lock:
         cached = profile_cache.get(key)
-        if cached and now - cached["time"] < PROFILE_CACHE_SECONDS:
-            return cached["profile"]
+        if cached:
+            ttl = PROFILE_CACHE_SECONDS if cached["profile"] else PROFILE_FAILURE_CACHE_SECONDS
+            if now - cached["time"] < ttl:
+                return cached["profile"]
 
     profile = get_member_profile(group_id, user_id)
+    with profile_lock:
+        profile_cache[key] = {"time": now, "profile": profile}
 
-    if profile:
-        with profile_lock:
-            profile_cache[key] = {
-                "time": now,
-                "profile": profile,
-            }
+    # 이름을 이번에 알아냈으면 과거 기록의 이름도 보완합니다.
+    if profile and profile.get("displayName"):
+        try:
+            with get_db() as conn:
+                conn.execute("""
+                    UPDATE message_events
+                    SET display_name = %s
+                    WHERE group_id = %s AND user_id = %s
+                      AND (display_name IS NULL OR display_name = '' OR display_name = user_id)
+                """, (profile["displayName"], group_id, user_id))
+        except Exception:
+            logger.exception("과거 메시지 표시 이름 보완 실패")
 
     return profile
 
@@ -440,8 +461,6 @@ def find_admin_users(group_id):
             FROM message_events
             WHERE group_id = %s
               AND user_id IS NOT NULL
-              AND display_name IS NOT NULL
-              AND display_name <> ''
             GROUP BY user_id
             ORDER BY MAX(created_at) DESC
         """, (group_id,)).fetchall()
@@ -559,7 +578,8 @@ def reply_admin_mentions(reply_token, group_id, command):
         return
 
     prefix = "여초 관리자 호출!\n" if command == "*여초" else "남초 관리자 호출!\n"
-    text = prefix + " ".join(text_parts)
+    suffix = "\n여초1" if command == "*여초" else "\n남초1"
+    text = prefix + " ".join(text_parts) + suffix
 
     try:
         reply_text_v2(reply_token, text, substitutions)
@@ -621,7 +641,7 @@ def get_ranking(group_id, start_date, end_date):
         rows = conn.execute("""
             SELECT
                 user_id,
-                MAX(NULLIF(display_name, user_id)) AS display_name,
+                MAX(NULLIF(NULLIF(display_name, user_id), '')) AS display_name,
                 COUNT(*) AS message_count
             FROM message_events
             WHERE group_id = %s
@@ -629,7 +649,7 @@ def get_ranking(group_id, start_date, end_date):
               AND created_at >= %s
               AND created_at < %s
             GROUP BY user_id
-            ORDER BY COUNT(*) DESC, LOWER(MAX(display_name)) ASC
+            ORDER BY COUNT(*) DESC, LOWER(MAX(NULLIF(display_name, user_id))) ASC
             LIMIT 30
         """, (group_id, start_dt, end_dt)).fetchall()
 
@@ -714,7 +734,7 @@ def tavily_search(query):
                 "max_results": 5,
                 "include_answer": True,
             },
-            timeout=12,
+            timeout=4,
         )
 
         if not response.ok:
@@ -844,7 +864,8 @@ def gemini_answer(user_text, event):
 
     last_error = None
 
-    for model in get_gemini_models():
+    # 응답 토큰이 만료되기 전에 끝내기 위해 한 번에 최대 두 모델만 시도합니다.
+    for model in get_gemini_models()[:2]:
         with cooldown_lock:
             cooldown_until = model_cooldowns.get(model, 0)
 
@@ -880,7 +901,7 @@ def gemini_answer(user_text, event):
                     "Content-Type": "application/json",
                 },
                 json=payload,
-                timeout=45,
+                timeout=GEMINI_REQUEST_TIMEOUT,
             )
 
             if response.status_code == 429:
@@ -906,6 +927,18 @@ def gemini_answer(user_text, event):
                     response.status_code,
                     response.text[:800],
                 )
+                with cooldown_lock:
+                    model_cooldowns[model] = time.time() + MODEL_COOLDOWN_SECONDS
+                last_error = f"{model}: {response.status_code}"
+                continue
+
+            if response.status_code >= 500:
+                logger.warning(
+                    "Gemini 일시 오류 model=%s status=%s body=%s",
+                    model, response.status_code, response.text[:500],
+                )
+                with cooldown_lock:
+                    model_cooldowns[model] = time.time() + MODEL_COOLDOWN_SECONDS
                 last_error = f"{model}: {response.status_code}"
                 continue
 
@@ -938,60 +971,12 @@ def gemini_answer(user_text, event):
                 if part.get("text")
             ).strip()
 
-            # 잘린 답변을 정상 답변처럼 전송하지 않습니다.
+            # 잘린 답변은 긴 재요청으로 replyToken 시간을 소모하지 않고
+            # 다음 모델로 넘어갑니다.
             if finish_reason == "MAX_TOKENS":
-                logger.warning(
-                    "Gemini 답변 길이 제한 model=%s",
-                    model,
-                )
-
-                payload["generationConfig"]["maxOutputTokens"] = 1400
-
-                retry_response = requests.post(
-                    url,
-                    headers={
-                        "x-goog-api-key": GEMINI_API_KEY,
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=45,
-                )
-
-                if not retry_response.ok:
-                    logger.warning(
-                        "Gemini 긴 답변 재시도 실패 model=%s status=%s",
-                        model,
-                        retry_response.status_code,
-                    )
-                    last_error = f"{model}: 긴 답변 재시도 실패"
-                    continue
-
-                retry_data = retry_response.json()
-                retry_candidates = retry_data.get("candidates", [])
-
-                if not retry_candidates:
-                    last_error = f"{model}: 재시도 결과 없음"
-                    continue
-
-                retry_candidate = retry_candidates[0]
-                retry_reason = retry_candidate.get("finishReason", "")
-                retry_parts = (
-                    retry_candidate.get("content", {}).get("parts", [])
-                )
-
-                answer = "\n".join(
-                    part.get("text", "")
-                    for part in retry_parts
-                    if part.get("text")
-                ).strip()
-
-                if retry_reason == "MAX_TOKENS":
-                    logger.warning(
-                        "Gemini 재시도 답변도 잘림 model=%s",
-                        model,
-                    )
-                    last_error = f"{model}: 답변이 계속 잘림"
-                    continue
+                logger.warning("Gemini 답변 길이 제한 model=%s", model)
+                last_error = f"{model}: 답변 길이 제한"
+                continue
 
             answer = clean_answer(answer)
 
@@ -1088,7 +1073,9 @@ def handle_text(event):
             )
             return
 
+        started = time.time()
         answer = gemini_answer(user_text, event)
+        logger.info("AI 처리 시간 %.2f초", time.time() - started)
         reply_text(reply_token, answer)
         return
 
