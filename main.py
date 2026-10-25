@@ -231,15 +231,34 @@ def reply_text_v2(reply_token, text, substitutions):
     if not reply_token:
         return
 
+    # LINE textV2의 substitution은 리스트가 아닌 placeholder 키를 가진 객체입니다.
+    substitution_map = {}
+    for item in (substitutions or [])[:20]:
+        placeholder = str(item.get("placeholder") or "").strip()
+        key = placeholder.strip("{}")
+        mentionee = item.get("mentionee") or {}
+        user_id = str(mentionee.get("userId") or "").strip()
+        if not key or not user_id:
+            continue
+        substitution_map[key] = {
+            "type": "mention",
+            "mentionee": {
+                "type": "user",
+                "userId": user_id,
+            },
+        }
+
+    message = {
+        "type": "textV2",
+        "text": str(text or "")[:4900],
+    }
+    if substitution_map:
+        message["substitution"] = substitution_map
+
     payload = {
         "replyToken": reply_token,
-        "messages": [{
-            "type": "textV2",
-            "text": text[:4900],
-            "substitution": substitutions,
-        }],
+        "messages": [message],
     }
-
     line_api("message/reply", payload)
 
 
@@ -326,9 +345,26 @@ def record_message(event):
         if profile:
             display_name = profile.get("displayName", "")
 
-    # 프로필 조회에 실패해도 기존에 기록된 이름을 유지
-    if not display_name:
-        display_name = user_id
+    # 프로필 API가 실패하면 기존 DB에 저장된 표시 이름을 유지합니다.
+    # user_id를 display_name에 저장하면 순위에 긴 ID가 노출되므로 저장하지 않습니다.
+    if not display_name and group_id:
+        try:
+            with get_db() as conn:
+                previous = conn.execute("""
+                    SELECT display_name
+                    FROM message_events
+                    WHERE group_id = %s
+                      AND user_id = %s
+                      AND display_name IS NOT NULL
+                      AND display_name <> ''
+                      AND display_name <> user_id
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (group_id, user_id)).fetchone()
+            if previous:
+                display_name = previous["display_name"] or ""
+        except Exception:
+            logger.exception("기존 표시 이름 조회 실패")
 
     event_id = (
         event.get("webhookEventId")
@@ -536,12 +572,8 @@ def reply_admin_mentions(reply_token, group_id, command):
             )
 
     except Exception:
+        # LINE이 replyToken을 이미 소비했을 수 있으므로 같은 토큰으로 재전송하지 않습니다.
         logger.exception("실제 관리자 멘션 전송 실패")
-        reply_text(
-            reply_token,
-            "관리자 멘션 전송에 실패했어요. "
-            "Render 로그에서 LINE API 오류 내용을 확인해 주세요.",
-        )
 
 
 # =========================================================
@@ -589,7 +621,7 @@ def get_ranking(group_id, start_date, end_date):
         rows = conn.execute("""
             SELECT
                 user_id,
-                MAX(display_name) AS display_name,
+                MAX(NULLIF(display_name, user_id)) AS display_name,
                 COUNT(*) AS message_count
             FROM message_events
             WHERE group_id = %s
@@ -619,7 +651,7 @@ def format_ranking(rows, start_date, end_date):
     lines = [title, ""]
 
     for index, row in enumerate(rows, start=1):
-        name = row["display_name"] or "이름 없음"
+        name = row["display_name"] or "이름 확인 필요"
         count = row["message_count"]
         lines.append(f"{index}위. {name} — {count}마디")
 
